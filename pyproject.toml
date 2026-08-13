@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cbzfit"
+version = "0.1.0"
+description = "Resize and optimize manga CBZ archives for e-readers and other displays."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "luigibrosse" }
+]
+dependencies = [
+    "Pillow>=12"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=6",
+    "ruff>=0.12"
+]
+
+[project.scripts]
+cbzfit = "cbzfit.cli:main"
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests"]
+cache_dir = ".venv/pytest_cache"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
