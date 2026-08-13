@@ -49,8 +49,13 @@ def calculate_display_fit(
     image_width, image_height = original_size
     screen_width, screen_height = portrait_screen_size
 
+    if screen_width <= 0 or screen_height <= 0:
+        raise ValueError("Screen dimensions must be positive integers.")
+
     if screen_width > screen_height:
-        raise ValueError("Screen size must be provided in portrait orientation.")
+        raise ValueError(
+            "Screen size must be provided in portrait orientation."
+        )
 
     image_is_landscape = image_width > image_height
 

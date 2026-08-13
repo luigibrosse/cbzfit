@@ -70,6 +70,15 @@ def test_square_image_uses_portrait_display_bounds() -> None:
     assert result == (1404, 1404)
 
 
+def test_square_screen_dimensions_are_accepted() -> None:
+    result = calculate_display_fit(
+        original_size=(2000, 2000),
+        portrait_screen_size=(1404, 1404),
+    )
+
+    assert result == (1404, 1404)
+
+
 @pytest.mark.parametrize(
     "original_size",
     [
@@ -130,6 +139,28 @@ def test_invalid_bound_dimensions_are_rejected(
         fit_size_within(
             original_size=(2297, 3247),
             bounds=bounds,
+        )
+
+
+@pytest.mark.parametrize(
+    "portrait_screen_size",
+    [
+        (0, 1404),
+        (1404, 0),
+        (-1, 1404),
+        (1404, -1),
+    ],
+)
+def test_invalid_screen_dimensions_are_rejected(
+    portrait_screen_size: tuple[int, int],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="Screen dimensions must be positive integers",
+    ):
+        calculate_display_fit(
+            original_size=(2297, 3247),
+            portrait_screen_size=portrait_screen_size,
         )
 
 
