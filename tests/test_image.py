@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import pytest
+from PIL import Image
 
-from cbzfit.image import calculate_display_fit, fit_size_within
+from cbzfit.image import (
+    calculate_display_fit,
+    fit_size_within,
+    resize_for_display,
+)
 
 
 def test_portrait_manga_page_fits_portrait_display() -> None:
@@ -173,3 +178,106 @@ def test_landscape_screen_dimensions_are_rejected() -> None:
             original_size=(2297, 3247),
             portrait_screen_size=(1872, 1404),
         )
+
+
+def test_portrait_image_is_resized_for_portrait_display() -> None:
+    image = Image.new(
+        mode="RGB",
+        size=(2297, 3247),
+        color="white",
+    )
+
+    result = resize_for_display(
+        image=image,
+        portrait_screen_size=(1404, 1872),
+    )
+
+    assert result.size == (1324, 1872)
+    assert result is not image
+    assert image.size == (2297, 3247)
+
+
+def test_landscape_image_is_resized_for_landscape_display() -> None:
+    image = Image.new(
+        mode="RGB",
+        size=(4594, 3247),
+        color="white",
+    )
+
+    result = resize_for_display(
+        image=image,
+        portrait_screen_size=(1404, 1872),
+    )
+
+    assert result.size == (1872, 1323)
+    assert result is not image
+    assert image.size == (4594, 3247)
+
+
+def test_landscape_image_can_use_portrait_display_bounds() -> None:
+    image = Image.new(
+        mode="RGB",
+        size=(4594, 3247),
+        color="white",
+    )
+
+    result = resize_for_display(
+        image=image,
+        portrait_screen_size=(1404, 1872),
+        use_landscape_display=False,
+    )
+
+    assert result.size == (1404, 992)
+    assert result is not image
+    assert image.size == (4594, 3247)
+
+
+def test_image_is_returned_unchanged_when_resize_is_not_required() -> None:
+    image = Image.new(
+        mode="RGB",
+        size=(1000, 1400),
+        color="white",
+    )
+
+    result = resize_for_display(
+        image=image,
+        portrait_screen_size=(1404, 1872),
+    )
+
+    assert result is image
+    assert result.size == (1000, 1400)
+
+
+def test_image_is_upscaled_when_enabled() -> None:
+    image = Image.new(
+        mode="RGB",
+        size=(1000, 500),
+        color="white",
+    )
+
+    result = resize_for_display(
+        image=image,
+        portrait_screen_size=(1404, 1872),
+        allow_upscale=True,
+    )
+
+    assert result.size == (1872, 936)
+    assert result is not image
+    assert image.size == (1000, 500)
+
+
+def test_image_accepts_bicubic_resampling() -> None:
+    image = Image.new(
+        mode="RGB",
+        size=(2297, 3247),
+        color="white",
+    )
+
+    result = resize_for_display(
+        image=image,
+        portrait_screen_size=(1404, 1872),
+        resample=Image.Resampling.BICUBIC,
+    )
+
+    assert result.size == (1324, 1872)
+    assert result is not image

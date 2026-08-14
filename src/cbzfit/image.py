@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from PIL import Image
+
 
 def fit_size_within(
     original_size: tuple[int, int],
@@ -35,8 +37,7 @@ def calculate_display_fit(
     use_landscape_display: bool = True,
     allow_upscale: bool = False,
 ) -> tuple[int, int]:
-    """
-    Calculate the image size for the expected display orientation.
+    """Calculate the image size for the expected display orientation.
 
     portrait_screen_size must contain the display resolution as
     (width, height) in portrait orientation.
@@ -68,4 +69,32 @@ def calculate_display_fit(
         original_size=original_size,
         bounds=display_bounds,
         allow_upscale=allow_upscale,
+    )
+
+
+def resize_for_display(
+    image: Image.Image,
+    portrait_screen_size: tuple[int, int],
+    use_landscape_display: bool = True,
+    allow_upscale: bool = False,
+    resample: Image.Resampling = Image.Resampling.LANCZOS,
+) -> Image.Image:
+    """Resize an image to the size calculated by calculate_display_fit().
+
+    The original image is returned unchanged when resizing is not required.
+    Otherwise, a new image is returned using the selected resampling filter.
+    """
+    target_size = calculate_display_fit(
+        original_size=image.size,
+        portrait_screen_size=portrait_screen_size,
+        use_landscape_display=use_landscape_display,
+        allow_upscale=allow_upscale,
+    )
+
+    if target_size == image.size:
+        return image
+
+    return image.resize(
+        target_size,
+        resample=resample,
     )
