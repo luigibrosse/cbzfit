@@ -68,7 +68,7 @@ def test_supported_image_extensions_are_case_insensitive(
         "page",
         "page.gif",
         "page.bmp",
-        ".jpg",
+        ".jpg", #Hidden file whose entire name is ".jpg"; suffix is empty
     ],
 )
 def test_unsupported_or_missing_image_extensions_are_rejected(

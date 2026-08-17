@@ -5,14 +5,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from unicodedata import category
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
-SUPPORTED_IMAGE_EXTENSIONS = frozenset(
-    {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp",
-    }
-)
+from cbzfit.decode import EXTENSION_FORMATS
 
 SUPPORTED_ZIP_COMPRESSION = frozenset(
     {
@@ -59,7 +52,10 @@ def has_supported_image_extension(filename: str) -> bool:
 
     The check is case-insensitive and does not inspect the file contents.
     """
-    return PurePosixPath(filename).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    return (
+        PurePosixPath(filename).suffix.lower()
+        in EXTENSION_FORMATS
+    )
 
 
 def contains_control_characters(value: str) -> bool:
