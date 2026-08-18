@@ -3,7 +3,8 @@
 from cbzfit.cli import build_parser
 
 
-def test_program_name() -> None:
-    parser = build_parser()
+class TestBuildParser:
 
-    assert parser.prog == "cbzfit"
+    def test_program_name(self) -> None:
+        parser = build_parser()
+        assert parser.prog == 'cbzfit'
