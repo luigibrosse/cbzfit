@@ -3,7 +3,13 @@
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from unicodedata import category
-from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
+from zipfile import (
+    ZIP_DEFLATED,
+    ZIP_STORED,
+    BadZipFile,
+    ZipFile,
+    ZipInfo,
+)
 
 from cbzfit.decode import EXTENSION_FORMATS
 
@@ -19,6 +25,7 @@ DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE = 512 * 1024**2
 DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE = 4 * 1024**3
 DEFAULT_MAX_MEMBER_PATH_LENGTH = 1_024
 DEFAULT_MAX_PATH_COMPONENT_LENGTH = 255
+DEFAULT_MEMBER_READ_CHUNK_SIZE = 64 * 1024
 
 
 class InvalidArchiveError(ValueError):
@@ -47,6 +54,40 @@ class ArchiveManifest:
         )
 
 
+@dataclass(frozen=True)
+class ArchiveReadLimits:
+    """Store limits applied while reading decompressed archive members."""
+
+    max_file_size: int = DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE
+    max_total_size: int = DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
+
+    def __post_init__(self) -> None:
+        """Validate archive-member read limits."""
+        if self.max_file_size <= 0:
+            raise ValueError(
+                "Maximum file size must be a positive integer."
+            )
+
+        if self.max_total_size <= 0:
+            raise ValueError(
+                "Maximum total uncompressed size must be a positive integer."
+            )
+
+
+@dataclass
+class ArchiveReadState:
+    """Track the total number of successfully read decompressed bytes."""
+
+    total_size: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate the initial archive-member read state."""
+        if self.total_size < 0:
+            raise ValueError(
+                "Total read size must not be negative."
+            )
+
+
 def has_supported_image_extension(filename: str) -> bool:
     """Return whether a filename has a supported image extension.
 
@@ -60,7 +101,10 @@ def has_supported_image_extension(filename: str) -> bool:
 
 def contains_control_characters(value: str) -> bool:
     """Return whether text contains Unicode control characters."""
-    return any(category(character) == "Cc" for character in value)
+    return any(
+        category(character) == "Cc"
+        for character in value
+    )
 
 
 def validate_member_path(
@@ -128,6 +172,68 @@ def validate_member_path(
     return normalized_path
 
 
+def read_member_data(
+    archive: ZipFile,
+    member: ZipInfo,
+    *,
+    limits: ArchiveReadLimits,
+    state: ArchiveReadState,
+    chunk_size: int = DEFAULT_MEMBER_READ_CHUNK_SIZE,
+) -> bytes:
+    """Read an archive member while enforcing actual decompressed limits.
+
+    Reading the member completely allows the ZIP implementation to validate
+    the compressed data and CRC. The cumulative state is updated only after
+    the complete member has been read successfully.
+    """
+    if chunk_size <= 0:
+        raise ValueError(
+            "Archive member read chunk size must be a positive integer."
+        )
+
+    if state.total_size > limits.max_total_size:
+        raise InvalidArchiveError(
+            "The archive's uncompressed contents exceed the permitted "
+            "size while reading."
+        )
+
+    chunks: list[bytes] = []
+    member_size = 0
+
+    try:
+        with archive.open(member, mode="r") as member_stream:
+            while chunk := member_stream.read(chunk_size):
+                member_size += len(chunk)
+
+                if member_size > limits.max_file_size:
+                    raise InvalidArchiveError(
+                        "Archive member exceeds the permitted size while "
+                        f"reading: {member.filename!r}."
+                    )
+
+                if (
+                    state.total_size + member_size
+                    > limits.max_total_size
+                ):
+                    raise InvalidArchiveError(
+                        "The archive's uncompressed contents exceed the "
+                        "permitted size while reading."
+                    )
+
+                chunks.append(chunk)
+
+    except InvalidArchiveError:
+        raise
+    except (BadZipFile, EOFError, OSError, RuntimeError) as error:
+        raise InvalidArchiveError(
+            f"Failed to read archive member: {member.filename!r}."
+        ) from error
+
+    state.total_size += member_size
+
+    return b"".join(chunks)
+
+
 def verify_archive_integrity(archive: ZipFile) -> None:
     """Verify the CRC and file header of every archive member."""
     corrupt_member = archive.testzip()
@@ -143,8 +249,12 @@ def build_manifest(
     archive: ZipFile,
     *,
     max_files: int = DEFAULT_MAX_ARCHIVE_FILES,
-    max_file_uncompressed_size: int = DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE,
-    max_total_uncompressed_size: int = DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+    max_file_uncompressed_size: int = (
+        DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE
+    ),
+    max_total_uncompressed_size: int = (
+        DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
+    ),
     max_path_length: int = DEFAULT_MAX_MEMBER_PATH_LENGTH,
     max_component_length: int = DEFAULT_MAX_PATH_COMPONENT_LENGTH,
 ) -> ArchiveManifest:
@@ -260,8 +370,12 @@ def inspect_cbz(
     archive_path: Path,
     *,
     max_files: int = DEFAULT_MAX_ARCHIVE_FILES,
-    max_file_uncompressed_size: int = DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE,
-    max_total_uncompressed_size: int = DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE,
+    max_file_uncompressed_size: int = (
+        DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE
+    ),
+    max_total_uncompressed_size: int = (
+        DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
+    ),
     max_path_length: int = DEFAULT_MAX_MEMBER_PATH_LENGTH,
     max_component_length: int = DEFAULT_MAX_PATH_COMPONENT_LENGTH,
 ) -> ArchiveManifest:
@@ -281,6 +395,7 @@ def inspect_cbz(
                 max_path_length=max_path_length,
                 max_component_length=max_component_length,
             )
+
     except BadZipFile as error:
         raise InvalidArchiveError(
             f"File is not a valid ZIP archive: {archive_path}."

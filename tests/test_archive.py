@@ -3,17 +3,29 @@
 import re
 from io import BytesIO
 from pathlib import Path
+from typing import Self
 from unittest.mock import Mock
-from zipfile import ZIP_BZIP2, ZIP_DEFLATED, ZIP_STORED, ZipFile
+from zipfile import (
+    ZIP_BZIP2,
+    ZIP_DEFLATED,
+    ZIP_STORED,
+    BadZipFile,
+    ZipFile,
+    ZipInfo,
+)
 
 import pytest
 
 from cbzfit.archive import (
+    DEFAULT_MEMBER_READ_CHUNK_SIZE,
+    ArchiveReadLimits,
+    ArchiveReadState,
     InvalidArchiveError,
     build_manifest,
     contains_control_characters,
     has_supported_image_extension,
     inspect_cbz,
+    read_member_data,
     validate_member_path,
     verify_archive_integrity,
 )
@@ -43,6 +55,53 @@ def create_archive(
     archive_stream.seek(0)
     return archive_stream
 
+class TrackingStream:
+    """Track reads and closure of an in-memory member stream."""
+
+    def __init__(self, data: bytes) -> None:
+        self._stream = BytesIO(data)
+        self.read_sizes: list[int] = []
+        self.closed = False
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.closed = True
+        self._stream.close()
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return self._stream.read(size)
+
+
+class FailingStream:
+    """Raise a configured exception when member data is read."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.closed = False
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.closed = True
+
+    def read(self, size: int = -1) -> bytes:
+        raise self.error
+
+
 class TestHasSupportedImageExtension:
 
     @pytest.mark.parametrize(
@@ -70,7 +129,7 @@ class TestHasSupportedImageExtension:
             "page",
             "page.gif",
             "page.bmp",
-            ".jpg",  #Hidden file whose entire name is ".jpg"; suffix is empty
+            ".jpg",  # Hidden file whose entire name is ".jpg"; suffix is empty
         ],
     )
     def test_unsupported_or_missing_image_extensions_are_rejected(
@@ -228,6 +287,416 @@ class TestValidateMemberPath:
                 "001.jpg",
                 **arguments,
             )
+
+class TestArchiveReadLimits:
+    def test_default_limits_are_created(self) -> None:
+        limits = ArchiveReadLimits()
+
+        assert limits.max_file_size > 0
+        assert limits.max_total_size > 0
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected_message"),
+        [
+            (
+                {"max_file_size": 0},
+                "Maximum file size must be a positive integer.",
+            ),
+            (
+                {"max_file_size": -1},
+                "Maximum file size must be a positive integer.",
+            ),
+            (
+                {"max_total_size": 0},
+                "Maximum total uncompressed size must be a positive integer.",
+            ),
+            (
+                {"max_total_size": -1},
+                "Maximum total uncompressed size must be a positive integer.",
+            ),
+        ],
+    )
+    def test_invalid_limits_are_rejected(
+        self,
+        arguments: dict[str, int],
+        expected_message: str,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            ArchiveReadLimits(**arguments)
+
+
+class TestArchiveReadState:
+    def test_default_state_starts_at_zero(self) -> None:
+        state = ArchiveReadState()
+
+        assert state.total_size == 0
+
+    def test_existing_total_is_retained(self) -> None:
+        state = ArchiveReadState(total_size=10)
+
+        assert state.total_size == 10
+
+    def test_negative_total_is_rejected(self) -> None:
+        expected_message = "Total read size must not be negative."
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            ArchiveReadState(total_size=-1)
+
+
+class TestReadMemberData:
+    def test_member_data_is_returned(self) -> None:
+        content = b"archive member content"
+        archive_stream = create_archive(
+            [("001.jpg", content)],
+            compression=ZIP_DEFLATED,
+        )
+        state = ArchiveReadState()
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            result = read_member_data(
+                archive,
+                archive.getinfo("001.jpg"),
+                limits=ArchiveReadLimits(),
+                state=state,
+            )
+
+        assert result == content
+        assert state.total_size == len(content)
+
+    def test_empty_member_is_returned(self) -> None:
+        archive_stream = create_archive(
+            [("ComicInfo.xml", b"")],
+        )
+        state = ArchiveReadState()
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            result = read_member_data(
+                archive,
+                archive.getinfo("ComicInfo.xml"),
+                limits=ArchiveReadLimits(),
+                state=state,
+            )
+
+        assert result == b""
+        assert state.total_size == 0
+
+    def test_multiple_chunks_are_combined_and_stream_is_closed(self) -> None:
+        content = b"abcdefghij"
+        member = ZipInfo("001.jpg")
+        member_stream = TrackingStream(content)
+        archive = Mock(spec=ZipFile)
+        archive.open.return_value = member_stream
+        state = ArchiveReadState()
+
+        result = read_member_data(
+            archive,
+            member,
+            limits=ArchiveReadLimits(
+                max_file_size=20,
+                max_total_size=20,
+            ),
+            state=state,
+            chunk_size=3,
+        )
+
+        assert result == content
+        assert state.total_size == len(content)
+        assert member_stream.read_sizes == [3, 3, 3, 3, 3]
+        assert member_stream.closed is True
+        archive.open.assert_called_once_with(member, mode="r")
+
+    def test_member_at_file_size_limit_is_accepted(self) -> None:
+        content = b"12345"
+        archive_stream = create_archive([("001.jpg", content)])
+        state = ArchiveReadState()
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            result = read_member_data(
+                archive,
+                archive.getinfo("001.jpg"),
+                limits=ArchiveReadLimits(
+                    max_file_size=len(content),
+                    max_total_size=len(content),
+                ),
+                state=state,
+            )
+
+        assert result == content
+        assert state.total_size == len(content)
+
+    def test_actual_file_size_limit_is_enforced(self) -> None:
+        archive_stream = create_archive([("001.jpg", b"12345")])
+        state = ArchiveReadState()
+        expected_message = (
+            "Archive member exceeds the permitted size while reading: "
+            "'001.jpg'."
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive, pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            read_member_data(
+                archive,
+                archive.getinfo("001.jpg"),
+                limits=ArchiveReadLimits(
+                    max_file_size=4,
+                    max_total_size=10,
+                ),
+                state=state,
+                chunk_size=2,
+            )
+
+        assert state.total_size == 0
+
+    def test_member_at_total_size_limit_is_accepted(self) -> None:
+        archive_stream = create_archive(
+            [
+                ("001.jpg", b"123"),
+                ("002.jpg", b"45"),
+            ]
+        )
+        limits = ArchiveReadLimits(
+            max_file_size=5,
+            max_total_size=5,
+        )
+        state = ArchiveReadState()
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            first_result = read_member_data(
+                archive,
+                archive.getinfo("001.jpg"),
+                limits=limits,
+                state=state,
+            )
+            second_result = read_member_data(
+                archive,
+                archive.getinfo("002.jpg"),
+                limits=limits,
+                state=state,
+            )
+
+        assert first_result == b"123"
+        assert second_result == b"45"
+        assert state.total_size == 5
+
+    def test_actual_total_size_limit_is_enforced(self) -> None:
+        archive_stream = create_archive(
+            [
+                ("001.jpg", b"123"),
+                ("002.jpg", b"456"),
+            ]
+        )
+        limits = ArchiveReadLimits(
+            max_file_size=5,
+            max_total_size=5,
+        )
+        state = ArchiveReadState()
+        expected_message = (
+            "The archive's uncompressed contents exceed the permitted "
+            "size while reading."
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            first_result = read_member_data(
+                archive,
+                archive.getinfo("001.jpg"),
+                limits=limits,
+                state=state,
+            )
+
+            with pytest.raises(
+                InvalidArchiveError,
+                match=exact_message(expected_message),
+            ):
+                read_member_data(
+                    archive,
+                    archive.getinfo("002.jpg"),
+                    limits=limits,
+                    state=state,
+                    chunk_size=2,
+                )
+
+        assert first_result == b"123"
+        assert state.total_size == 3
+
+    def test_total_size_already_above_limit_is_rejected(self) -> None:
+        archive = Mock(spec=ZipFile)
+        member = ZipInfo("001.jpg")
+        state = ArchiveReadState(total_size=6)
+        expected_message = (
+            "The archive's uncompressed contents exceed the permitted "
+            "size while reading."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            read_member_data(
+                archive,
+                member,
+                limits=ArchiveReadLimits(
+                    max_file_size=5,
+                    max_total_size=5,
+                ),
+                state=state,
+            )
+
+        assert state.total_size == 6
+        archive.open.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BadZipFile("Bad CRC-32"),
+            EOFError("Unexpected end of data"),
+            OSError("Decompression failure"),
+            RuntimeError("Archive read failure"),
+        ],
+    )
+    def test_archive_read_errors_are_wrapped(
+        self,
+        error: Exception,
+    ) -> None:
+        member = ZipInfo("Chapter 01/001.jpg")
+        member_stream = FailingStream(error)
+        archive = Mock(spec=ZipFile)
+        archive.open.return_value = member_stream
+        state = ArchiveReadState(total_size=10)
+        expected_message = (
+            "Failed to read archive member: 'Chapter 01/001.jpg'."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            read_member_data(
+                archive,
+                member,
+                limits=ArchiveReadLimits(
+                    max_file_size=20,
+                    max_total_size=20,
+                ),
+                state=state,
+            )
+
+        assert exception_info.value.__cause__ is error
+        assert state.total_size == 10
+        assert member_stream.closed is True
+
+    def test_archive_open_error_is_wrapped(self) -> None:
+        member = ZipInfo("001.jpg")
+        error = BadZipFile("Invalid local file header")
+        archive = Mock(spec=ZipFile)
+        archive.open.side_effect = error
+        state = ArchiveReadState()
+        expected_message = "Failed to read archive member: '001.jpg'."
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            read_member_data(
+                archive,
+                member,
+                limits=ArchiveReadLimits(),
+                state=state,
+            )
+
+        assert exception_info.value.__cause__ is error
+        assert state.total_size == 0
+        archive.open.assert_called_once_with(
+            member,
+            mode="r",
+        )
+
+    @pytest.mark.parametrize(
+        "chunk_size",
+        [
+            0,
+            -1,
+        ],
+    )
+    def test_invalid_chunk_size_is_rejected(
+        self,
+        chunk_size: int,
+    ) -> None:
+        archive = Mock(spec=ZipFile)
+        member = ZipInfo("001.jpg")
+        expected_message = (
+            "Archive member read chunk size must be a positive integer."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            read_member_data(
+                archive,
+                member,
+                limits=ArchiveReadLimits(),
+                state=ArchiveReadState(),
+                chunk_size=chunk_size,
+            )
+
+        archive.open.assert_not_called()
+
+    def test_default_chunk_size_is_used(self) -> None:
+        member = ZipInfo("001.jpg")
+        member_stream = TrackingStream(b"image")
+        archive = Mock(spec=ZipFile)
+        archive.open.return_value = member_stream
+
+        read_member_data(
+            archive,
+            member,
+            limits=ArchiveReadLimits(),
+            state=ArchiveReadState(),
+        )
+
+        assert member_stream.read_sizes == [
+            DEFAULT_MEMBER_READ_CHUNK_SIZE,
+            DEFAULT_MEMBER_READ_CHUNK_SIZE,
+        ]
+
+    def test_member_stream_is_closed_when_file_limit_is_exceeded(
+        self,
+    ) -> None:
+        member = ZipInfo("001.jpg")
+        member_stream = TrackingStream(b"12345")
+        archive = Mock(spec=ZipFile)
+        archive.open.return_value = member_stream
+        state = ArchiveReadState()
+        expected_message = (
+            "Archive member exceeds the permitted size while reading: "
+            "'001.jpg'."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            read_member_data(
+                archive,
+                member,
+                limits=ArchiveReadLimits(
+                    max_file_size=4,
+                    max_total_size=10,
+                ),
+                state=state,
+                chunk_size=2,
+            )
+
+        assert state.total_size == 0
+        assert member_stream.closed is True
 
 class TestBuildManifest:
 
