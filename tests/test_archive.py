@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Self
@@ -16,18 +17,26 @@ from zipfile import (
 
 import pytest
 
+import cbzfit.archive as archive_module
 from cbzfit.archive import (
     DEFAULT_MEMBER_READ_CHUNK_SIZE,
+    ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
     InvalidArchiveError,
+    MemberDateTimeMode,
+    MemberDateTimePolicy,
     build_manifest,
     contains_control_characters,
+    current_zip_date_time,
     has_supported_image_extension,
     inspect_cbz,
     read_member_data,
+    resolve_member_date_time,
     validate_member_path,
+    validate_zip_date_time,
     verify_archive_integrity,
+    write_member_data,
 )
 
 
@@ -170,6 +179,236 @@ class TestContainsControlCharacters:
     ) -> None:
         assert not contains_control_characters(value)
 
+class TestValidateZipDateTime:
+    @pytest.mark.parametrize(
+        "date_time",
+        [
+            (1980, 1, 1, 0, 0, 0),
+            (2026, 8, 22, 16, 30, 58),
+            (2107, 12, 31, 23, 59, 58),
+        ],
+    )
+    def test_valid_zip_timestamps_are_returned(
+        self,
+        date_time: tuple[int, int, int, int, int, int],
+    ) -> None:
+        assert validate_zip_date_time(date_time) is date_time
+
+    @pytest.mark.parametrize(
+        "date_time",
+        [
+            (),
+            (2026, 1, 1),
+            (2026, 1, 1, 0, 0, 0, 0),
+            [2026, 1, 1, 0, 0, 0],
+            (2026, 1, 1, 0, 0, "0"),
+            (2026, 1, 1, 0, 0, False),
+        ],
+    )
+    def test_timestamp_must_contain_exactly_six_integers(
+        self,
+        date_time: object,
+    ) -> None:
+        expected_message = (
+            "ZIP member timestamp must contain exactly six integers."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            validate_zip_date_time(date_time)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "date_time",
+        [
+            (2026, 2, 29, 0, 0, 0),
+            (2026, 13, 1, 0, 0, 0),
+            (2026, 1, 1, 24, 0, 0),
+        ],
+    )
+    def test_invalid_calendar_timestamp_is_rejected(
+        self,
+        date_time: tuple[int, int, int, int, int, int],
+    ) -> None:
+        expected_message = (
+            "ZIP member timestamp must be a valid date and time."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            validate_zip_date_time(date_time)
+
+    @pytest.mark.parametrize(
+        "date_time",
+        [
+            (1979, 12, 31, 23, 59, 58),
+            (2108, 1, 1, 0, 0, 0),
+        ],
+    )
+    def test_timestamp_year_outside_zip_range_is_rejected(
+        self,
+        date_time: tuple[int, int, int, int, int, int],
+    ) -> None:
+        expected_message = (
+            "ZIP member timestamp year must be between 1980 and 2107."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            validate_zip_date_time(date_time)
+
+    def test_odd_timestamp_second_is_rejected(self) -> None:
+        expected_message = (
+            "ZIP member timestamp seconds must use two-second precision."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            validate_zip_date_time((2026, 8, 22, 16, 30, 59))
+
+
+class TestMemberDateTimePolicy:
+    def test_default_policy_uses_modified_mode(self) -> None:
+        policy = MemberDateTimePolicy()
+
+        assert policy.mode is MemberDateTimeMode.MODIFIED
+        assert policy.fixed_date_time is None
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            MemberDateTimeMode.PRESERVE,
+            MemberDateTimeMode.MODIFIED,
+        ],
+    )
+    def test_non_fixed_policy_is_created(
+        self,
+        mode: MemberDateTimeMode,
+    ) -> None:
+        policy = MemberDateTimePolicy(mode=mode)
+
+        assert policy.mode is mode
+        assert policy.fixed_date_time is None
+
+    def test_fixed_policy_is_created(self) -> None:
+        fixed_date_time = (2020, 1, 2, 3, 4, 6)
+        policy = MemberDateTimePolicy(
+            mode=MemberDateTimeMode.FIXED,
+            fixed_date_time=fixed_date_time,
+        )
+
+        assert policy.mode is MemberDateTimeMode.FIXED
+        assert policy.fixed_date_time is fixed_date_time
+
+    def test_invalid_mode_type_is_rejected(self) -> None:
+        expected_message = (
+            "Archive-member timestamp mode must be a "
+            "MemberDateTimeMode, not str."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            MemberDateTimePolicy(mode="modified")  # type: ignore[arg-type]
+
+    def test_fixed_mode_requires_timestamp(self) -> None:
+        expected_message = (
+            "A fixed timestamp is required in fixed timestamp mode."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            MemberDateTimePolicy(mode=MemberDateTimeMode.FIXED)
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            MemberDateTimeMode.PRESERVE,
+            MemberDateTimeMode.MODIFIED,
+        ],
+    )
+    def test_fixed_timestamp_is_rejected_outside_fixed_mode(
+        self,
+        mode: MemberDateTimeMode,
+    ) -> None:
+        expected_message = (
+            "A fixed timestamp can only be used in fixed timestamp mode."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            MemberDateTimePolicy(
+                mode=mode,
+                fixed_date_time=(2020, 1, 2, 3, 4, 6),
+            )
+
+    def test_invalid_fixed_timestamp_is_rejected(self) -> None:
+        expected_message = (
+            "ZIP member timestamp must be a valid date and time."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            MemberDateTimePolicy(
+                mode=MemberDateTimeMode.FIXED,
+                fixed_date_time=(2020, 2, 30, 0, 0, 0),
+            )
+
+
+class TestArchivePathLimits:
+    def test_default_path_limits_are_created(self) -> None:
+        limits = ArchivePathLimits()
+
+        assert limits.max_path_length > 0
+        assert limits.max_component_length > 0
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected_message"),
+        [
+            (
+                {"max_path_length": 0},
+                "Maximum member path length must be a positive integer.",
+            ),
+            (
+                {"max_path_length": -1},
+                "Maximum member path length must be a positive integer.",
+            ),
+            (
+                {"max_component_length": 0},
+                "Maximum path component length must be a positive integer.",
+            ),
+            (
+                {"max_component_length": -1},
+                "Maximum path component length must be a positive integer.",
+            ),
+        ],
+    )
+    def test_invalid_path_limits_are_rejected(
+        self,
+        arguments: dict[str, int],
+        expected_message: str,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            ArchivePathLimits(**arguments)
+
+
 class TestValidateMemberPath:
 
     def test_member_path_is_normalized(self) -> None:
@@ -241,7 +480,9 @@ class TestValidateMemberPath:
         ):
             validate_member_path(
                 filename,
-                max_component_length=8,
+                limits=ArchivePathLimits(
+                    max_component_length=8,
+                ),
             )
 
 
@@ -257,36 +498,13 @@ class TestValidateMemberPath:
         ):
             validate_member_path(
                 filename,
-                max_path_length=10,
+                limits=ArchivePathLimits(
+                    max_path_length=10,
+                ),
             )
 
 
-    @pytest.mark.parametrize(
-        ("arguments", "expected_message"),
-        [
-            (
-                {"max_path_length": 0},
-                "Maximum member path length must be a positive integer.",
-            ),
-            (
-                {"max_component_length": 0},
-                "Maximum path component length must be a positive integer.",
-            ),
-        ],
-    )
-    def test_invalid_member_path_limits_are_rejected(
-        self,
-        arguments: dict[str, int],
-        expected_message: str,
-    ) -> None:
-        with pytest.raises(
-            ValueError,
-            match=exact_message(expected_message),
-        ):
-            validate_member_path(
-                "001.jpg",
-                **arguments,
-            )
+
 
 class TestArchiveReadLimits:
     def test_default_limits_are_created(self) -> None:
@@ -947,6 +1165,22 @@ class TestBuildManifest:
                 build_manifest(archive)
 
 
+    def test_custom_path_limits_are_applied(self) -> None:
+        filename = "Chapter 01/001.jpg"
+        archive_stream = create_archive([(filename, b"image")])
+        expected_message = (
+            f"Archive member path exceeds 10 characters: {filename!r}."
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive, pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            build_manifest(
+                archive,
+                path_limits=ArchivePathLimits(max_path_length=10),
+            )
+
     @pytest.mark.parametrize(
         ("arguments", "expected_message"),
         [
@@ -961,14 +1195,6 @@ class TestBuildManifest:
             (
                 {"max_total_uncompressed_size": 0},
                 "Maximum total uncompressed size must be a positive integer.",
-            ),
-            (
-                {"max_path_length": 0},
-                "Maximum member path length must be a positive integer.",
-            ),
-            (
-                {"max_component_length": 0},
-                "Maximum path component length must be a positive integer.",
             ),
         ],
     )
@@ -989,6 +1215,390 @@ class TestBuildManifest:
                 archive,
                 **arguments,
             )
+
+class TestCurrentZipDateTime:
+    def test_current_local_time_uses_zip_precision(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fixed_utc = datetime(2026, 8, 22, 14, 30, 59, tzinfo=UTC)
+        datetime_mock = Mock(wraps=datetime)
+        datetime_mock.now.return_value = fixed_utc
+        monkeypatch.setattr(
+            archive_module,
+            "datetime",
+            datetime_mock,
+        )
+
+        result = current_zip_date_time()
+
+        expected_local = fixed_utc.astimezone()
+        assert result == (
+            expected_local.year,
+            expected_local.month,
+            expected_local.day,
+            expected_local.hour,
+            expected_local.minute,
+            58,
+        )
+        datetime_mock.now.assert_called_once_with(UTC)
+
+
+class TestResolveMemberDateTime:
+    def test_preserve_mode_returns_source_timestamp(self) -> None:
+        source_date_time = (2020, 1, 2, 3, 4, 6)
+        member = ZipInfo("001.jpg", date_time=source_date_time)
+
+        result = resolve_member_date_time(
+            member,
+            policy=MemberDateTimePolicy(
+                mode=MemberDateTimeMode.PRESERVE,
+            ),
+            transformed=True,
+        )
+
+        assert result == source_date_time
+
+    def test_modified_mode_preserves_unchanged_member_timestamp(self) -> None:
+        source_date_time = (2020, 1, 2, 3, 4, 6)
+        member = ZipInfo("001.jpg", date_time=source_date_time)
+
+        result = resolve_member_date_time(
+            member,
+            policy=MemberDateTimePolicy(),
+            transformed=False,
+        )
+
+        assert result == source_date_time
+
+    def test_modified_mode_uses_current_time_for_transformed_member(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        member = ZipInfo("001.jpg", date_time=(2020, 1, 2, 3, 4, 6))
+        current_date_time = (2026, 8, 22, 16, 30, 58)
+        current_time = Mock(return_value=current_date_time)
+        monkeypatch.setattr(
+            archive_module,
+            "current_zip_date_time",
+            current_time,
+        )
+
+        result = resolve_member_date_time(
+            member,
+            policy=MemberDateTimePolicy(),
+            transformed=True,
+        )
+
+        assert result == current_date_time
+        current_time.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "transformed",
+        [False, True],
+    )
+    def test_fixed_mode_returns_configured_timestamp(
+        self,
+        transformed: bool,
+    ) -> None:
+        member = ZipInfo("001.jpg", date_time=(2020, 1, 2, 3, 4, 6))
+        fixed_date_time = (2000, 2, 4, 6, 8, 10)
+
+        result = resolve_member_date_time(
+            member,
+            policy=MemberDateTimePolicy(
+                mode=MemberDateTimeMode.FIXED,
+                fixed_date_time=fixed_date_time,
+            ),
+            transformed=transformed,
+        )
+
+        assert result == fixed_date_time
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            MemberDateTimeMode.PRESERVE,
+            MemberDateTimeMode.MODIFIED,
+        ],
+    )
+    def test_invalid_source_timestamp_is_rejected_when_preserved(
+        self,
+        mode: MemberDateTimeMode,
+    ) -> None:
+        member = ZipInfo("001.jpg")
+        member.date_time = (2020, 2, 30, 0, 0, 0)
+        expected_message = (
+            "ZIP member timestamp must be a valid date and time."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            resolve_member_date_time(
+                member,
+                policy=MemberDateTimePolicy(mode=mode),
+                transformed=False,
+            )
+
+
+class TestCloneMemberInfo:
+    def test_safe_metadata_is_cloned(self) -> None:
+        member = ZipInfo("Chapter 01/001.jpg", date_time=(2020, 1, 2, 3, 4, 6))
+        member.comment = b"member comment"
+        member.create_system = 3
+        member.internal_attr = 1
+        member.external_attr = 0o100644 << 16
+        member.flag_bits = 0x9
+        member.CRC = 123
+        member.compress_size = 456
+        member.file_size = 789
+        member.extra = b"stale-extra-record"
+
+        result = archive_module._clone_member_info(
+            member,
+            date_time=(2026, 8, 22, 16, 30, 58),
+            compression=ZIP_STORED,
+            path_limits=ArchivePathLimits(),
+        )
+
+        assert member.filename == "Chapter 01/001.jpg"
+        assert member.date_time == (2020, 1, 2, 3, 4, 6)
+        assert member.compress_type == ZIP_STORED
+        assert member.flag_bits == 0x9
+        assert member.CRC == 123
+        assert member.compress_size == 456
+        assert member.file_size == 789
+        assert member.extra == b"stale-extra-record"
+        assert result is not member
+        assert result.filename == member.filename
+        assert result.date_time == (2026, 8, 22, 16, 30, 58)
+        assert result.compress_type == ZIP_STORED
+        assert result.comment == member.comment
+        assert result.create_system == member.create_system
+        assert result.internal_attr == member.internal_attr
+        assert result.external_attr == member.external_attr
+        assert result.flag_bits == 0
+        assert not hasattr(result, "CRC")
+        assert result.compress_size == 0
+        assert result.file_size == 0
+        assert result.extra == b""
+
+    def test_replacement_filename_is_normalized(self) -> None:
+        member = ZipInfo("001.jpg")
+
+        result = archive_module._clone_member_info(
+            member,
+            date_time=(2026, 8, 22, 16, 30, 58),
+            compression=ZIP_STORED,
+            path_limits=ArchivePathLimits(),
+            filename=r"Chapter 01\001.png",
+        )
+
+        assert result.filename == "Chapter 01/001.png"
+
+    def test_custom_path_limits_are_applied_to_replacement_filename(self) -> None:
+        member = ZipInfo("001.jpg")
+        filename = "chapter/001.png"
+        expected_message = (
+            f"Archive member path exceeds 10 characters: {filename!r}."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            archive_module._clone_member_info(
+                member,
+                date_time=(2026, 8, 22, 16, 30, 58),
+                compression=ZIP_STORED,
+                path_limits=ArchivePathLimits(max_path_length=10),
+                filename=filename,
+            )
+
+    def test_unsupported_output_compression_is_rejected(self) -> None:
+        expected_message = "Unsupported ZIP compression method for output."
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            archive_module._clone_member_info(
+                ZipInfo("001.jpg"),
+                date_time=(2026, 8, 22, 16, 30, 58),
+                compression=ZIP_BZIP2,
+                path_limits=ArchivePathLimits(),
+            )
+
+
+class TestWriteMemberData:
+    @pytest.mark.parametrize(
+        "compression",
+        [
+            ZIP_STORED,
+            ZIP_DEFLATED,
+        ],
+    )
+    def test_member_is_written_and_returned(
+        self,
+        compression: int,
+    ) -> None:
+        archive_stream = BytesIO()
+        source_member = ZipInfo(
+            "ComicInfo.xml",
+            date_time=(2020, 1, 2, 3, 4, 6),
+        )
+        source_member.comment = b"member comment"
+        data = b"<ComicInfo />" * 20
+
+        with ZipFile(archive_stream, mode="w") as archive:
+            result = write_member_data(
+                archive,
+                source_member,
+                data,
+                compression=compression,
+                date_time_policy=MemberDateTimePolicy(
+                    mode=MemberDateTimeMode.PRESERVE,
+                ),
+                transformed=False,
+                path_limits=ArchivePathLimits(),
+            )
+
+            assert result is archive.getinfo("ComicInfo.xml")
+
+        archive_stream.seek(0)
+        with ZipFile(archive_stream, mode="r") as archive:
+            member = archive.getinfo("ComicInfo.xml")
+            assert archive.read(member) == data
+            assert member.compress_type == compression
+            assert member.date_time == source_member.date_time
+            assert member.comment == source_member.comment
+
+    def test_replacement_filename_is_written(self) -> None:
+        archive_stream = BytesIO()
+        source_member = ZipInfo("001.jpg", date_time=(2020, 1, 2, 3, 4, 6))
+
+        with ZipFile(archive_stream, mode="w") as archive:
+            write_member_data(
+                archive,
+                source_member,
+                b"converted image",
+                compression=ZIP_STORED,
+                date_time_policy=MemberDateTimePolicy(
+                    mode=MemberDateTimeMode.PRESERVE,
+                ),
+                transformed=True,
+                path_limits=ArchivePathLimits(),
+                filename="001.png",
+            )
+
+        archive_stream.seek(0)
+        with ZipFile(archive_stream, mode="r") as archive:
+            assert archive.namelist() == ["001.png"]
+            assert archive.read("001.png") == b"converted image"
+
+    def test_unicode_replacement_filename_is_written(self) -> None:
+        archive_stream = BytesIO()
+        source_member = ZipInfo(
+            "001.jpg",
+            date_time=(2020, 1, 2, 3, 4, 6),
+        )
+        output_filename = "進撃の巨人/第01話.png"
+
+        with ZipFile(archive_stream, mode="w") as archive:
+            write_member_data(
+                archive,
+                source_member,
+                b"converted image",
+                compression=ZIP_STORED,
+                date_time_policy=MemberDateTimePolicy(
+                    mode=MemberDateTimeMode.PRESERVE,
+                ),
+                transformed=True,
+                path_limits=ArchivePathLimits(),
+                filename=output_filename,
+            )
+
+        archive_stream.seek(0)
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            assert archive.namelist() == [output_filename]
+            assert archive.read(output_filename) == b"converted image"
+
+    def test_empty_member_data_is_written(self) -> None:
+        archive_stream = BytesIO()
+        source_member = ZipInfo("notes.txt", date_time=(2020, 1, 2, 3, 4, 6))
+
+        with ZipFile(archive_stream, mode="w") as archive:
+            write_member_data(
+                archive,
+                source_member,
+                b"",
+                compression=ZIP_DEFLATED,
+                date_time_policy=MemberDateTimePolicy(
+                    mode=MemberDateTimeMode.PRESERVE,
+                ),
+                transformed=False,
+                path_limits=ArchivePathLimits(),
+            )
+
+        archive_stream.seek(0)
+        with ZipFile(archive_stream, mode="r") as archive:
+            assert archive.read("notes.txt") == b""
+
+    def test_write_delegates_resolved_timestamp_and_metadata(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive = Mock(spec=ZipFile)
+        source_member = ZipInfo("001.jpg")
+        output_member = ZipInfo("001.png")
+        resolved_date_time = (2026, 8, 22, 16, 30, 58)
+        policy = MemberDateTimePolicy()
+        resolve = Mock(return_value=resolved_date_time)
+        clone = Mock(return_value=output_member)
+        monkeypatch.setattr(
+            archive_module,
+            "resolve_member_date_time",
+            resolve,
+        )
+        monkeypatch.setattr(
+            archive_module,
+            "_clone_member_info",
+            clone,
+        )
+        limits = ArchivePathLimits()
+
+        result = write_member_data(
+            archive,
+            source_member,
+            b"image data",
+            compression=ZIP_STORED,
+            date_time_policy=policy,
+            transformed=True,
+            path_limits=limits,
+            filename="001.png",
+        )
+
+        assert result is output_member
+        resolve.assert_called_once_with(
+            source_member,
+            policy=policy,
+            transformed=True,
+        )
+        clone.assert_called_once_with(
+            source_member,
+            date_time=resolved_date_time,
+            compression=ZIP_STORED,
+            path_limits=limits,
+            filename="001.png",
+        )
+        archive.writestr.assert_called_once_with(
+            output_member,
+            b"image data",
+        )
+
 
 class TestVerifyArchiveIntegrity:
 
@@ -1043,6 +1653,27 @@ class TestInspectCbz:
             for member in manifest.other_members
         ) == ("ComicInfo.xml",)
 
+
+    def test_inspect_cbz_applies_custom_path_limits(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "volume.cbz"
+        filename = "Chapter 01/001.jpg"
+        with ZipFile(archive_path, mode="w") as archive:
+            archive.writestr(filename, b"image")
+        expected_message = (
+            f"Archive member path exceeds 10 characters: {filename!r}."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            inspect_cbz(
+                archive_path,
+                path_limits=ArchivePathLimits(max_path_length=10),
+            )
 
     def test_inspect_cbz_rejects_missing_file(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "missing.cbz"

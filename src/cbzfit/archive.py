@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from unicodedata import category
 from zipfile import (
@@ -27,9 +29,114 @@ DEFAULT_MAX_MEMBER_PATH_LENGTH = 1_024
 DEFAULT_MAX_PATH_COMPONENT_LENGTH = 255
 DEFAULT_MEMBER_READ_CHUNK_SIZE = 64 * 1024
 
+ZipDateTime = tuple[int, int, int, int, int, int]
+
 
 class InvalidArchiveError(ValueError):
     """Raised when an input archive does not satisfy CBZFit requirements."""
+
+
+class MemberDateTimeMode(StrEnum):
+    """Define supported output archive-member timestamp modes."""
+
+    PRESERVE = "preserve"
+    MODIFIED = "modified"
+    FIXED = "fixed"
+
+
+def validate_zip_date_time(
+    date_time: ZipDateTime,
+) -> ZipDateTime:
+    """Validate and return a timestamp representable by the ZIP format."""
+    if (
+        not isinstance(date_time, tuple)
+        or len(date_time) != 6
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            for value in date_time
+        )
+    ):
+        raise ValueError(
+            "ZIP member timestamp must contain exactly six integers."
+        )
+
+    try:
+        timestamp = datetime(
+            *date_time,
+            tzinfo=UTC,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "ZIP member timestamp must be a valid date and time."
+        ) from error
+
+    if not 1980 <= timestamp.year <= 2107:
+        raise ValueError(
+            "ZIP member timestamp year must be between 1980 and 2107."
+        )
+
+    if timestamp.second % 2:
+        raise ValueError(
+            "ZIP member timestamp seconds must use two-second precision."
+        )
+
+    return date_time
+
+
+@dataclass(frozen=True)
+class MemberDateTimePolicy:
+    """Define how output archive-member timestamps are selected."""
+
+    mode: MemberDateTimeMode = MemberDateTimeMode.MODIFIED
+    fixed_date_time: ZipDateTime | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the archive-member timestamp policy."""
+        if not isinstance(self.mode, MemberDateTimeMode):
+            raise TypeError(
+                f"Archive-member timestamp mode must be a "
+                f"MemberDateTimeMode, not {type(self.mode).__name__}."
+            )
+
+        if (
+            self.mode is MemberDateTimeMode.FIXED
+            and self.fixed_date_time is None
+        ):
+            raise ValueError(
+                "A fixed timestamp is required in fixed timestamp mode."
+            )
+
+        if (
+            self.mode is not MemberDateTimeMode.FIXED
+            and self.fixed_date_time is not None
+        ):
+            raise ValueError(
+                "A fixed timestamp can only be used in fixed timestamp mode."
+            )
+
+        if self.fixed_date_time is not None:
+            validate_zip_date_time(self.fixed_date_time)
+
+
+@dataclass(frozen=True)
+class ArchivePathLimits:
+    """Store limits applied to archive-member paths."""
+
+    max_path_length: int = DEFAULT_MAX_MEMBER_PATH_LENGTH
+    max_component_length: int = DEFAULT_MAX_PATH_COMPONENT_LENGTH
+
+    def __post_init__(self) -> None:
+        """Validate archive-member path limits."""
+        if self.max_path_length <= 0:
+            raise ValueError(
+                "Maximum member path length must be a positive integer."
+            )
+
+        if self.max_component_length <= 0:
+            raise ValueError(
+                "Maximum path component length must be a positive integer."
+            )
 
 
 @dataclass(frozen=True)
@@ -110,8 +217,7 @@ def contains_control_characters(value: str) -> bool:
 def validate_member_path(
     filename: str,
     *,
-    max_path_length: int = DEFAULT_MAX_MEMBER_PATH_LENGTH,
-    max_component_length: int = DEFAULT_MAX_PATH_COMPONENT_LENGTH,
+    limits: ArchivePathLimits | None = None,
 ) -> str:
     """Validate and return a normalized archive member path.
 
@@ -119,15 +225,7 @@ def validate_member_path(
     share, contain control characters, contain an overlong path component, or
     contain a parent-directory component ("..").
     """
-    if max_path_length <= 0:
-        raise ValueError(
-            "Maximum member path length must be a positive integer."
-        )
-
-    if max_component_length <= 0:
-        raise ValueError(
-            "Maximum path component length must be a positive integer."
-        )
+    path_limits = limits or ArchivePathLimits()
 
     if not filename:
         raise InvalidArchiveError(
@@ -153,20 +251,21 @@ def validate_member_path(
         )
 
     if any(
-        len(component) > max_component_length
+        len(component) > path_limits.max_component_length
         for component in posix_path.parts
     ):
         raise InvalidArchiveError(
             f"Archive member contains a path component longer than "
-            f"{max_component_length} characters: {filename!r}."
+            f"{path_limits.max_component_length} characters: "
+            f"{filename!r}."
         )
 
     normalized_path = posix_path.as_posix()
 
-    if len(normalized_path) > max_path_length:
+    if len(normalized_path) > path_limits.max_path_length:
         raise InvalidArchiveError(
-            f"Archive member path exceeds {max_path_length} characters: "
-            f"{filename!r}."
+            f"Archive member path exceeds "
+            f"{path_limits.max_path_length} characters: {filename!r}."
         )
 
     return normalized_path
@@ -234,6 +333,147 @@ def read_member_data(
     return b"".join(chunks)
 
 
+def current_zip_date_time() -> ZipDateTime:
+    """Return the current local time using ZIP two-second precision."""
+    current_time = datetime.now(UTC).astimezone()
+    normalized_second = (
+        current_time.second
+        - current_time.second % 2
+    )
+
+    date_time = (
+        current_time.year,
+        current_time.month,
+        current_time.day,
+        current_time.hour,
+        current_time.minute,
+        normalized_second,
+    )
+
+    return validate_zip_date_time(date_time)
+
+
+def resolve_member_date_time(
+    member: ZipInfo,
+    *,
+    policy: MemberDateTimePolicy,
+    transformed: bool,
+) -> ZipDateTime:
+    """Resolve a valid output timestamp for an archive member.
+
+    Preserve mode always retains the source timestamp.
+
+    Modified mode retains the source timestamp for unchanged members and
+    generates the current timestamp for transformed members.
+
+    Fixed mode applies the configured fixed timestamp to every member.
+    """
+    if policy.mode is MemberDateTimeMode.PRESERVE:
+        return validate_zip_date_time(member.date_time)
+
+    if policy.mode is MemberDateTimeMode.MODIFIED:
+        if transformed:
+            return current_zip_date_time()
+
+        return validate_zip_date_time(member.date_time)
+
+    if policy.mode is MemberDateTimeMode.FIXED:
+        if policy.fixed_date_time is None:
+            raise RuntimeError(
+                "Fixed timestamp policy does not contain a timestamp."
+            )
+
+        return policy.fixed_date_time
+
+    raise ValueError(
+        f"Unsupported archive-member timestamp mode: {policy.mode!r}."
+    )
+
+
+def _clone_member_info(
+    member: ZipInfo,
+    *,
+    date_time: ZipDateTime,
+    compression: int,
+    path_limits: ArchivePathLimits,
+    filename: str | None = None,
+) -> ZipInfo:
+    """Create safe output metadata using resolved output policies.
+
+    The caller must provide a validated ZIP-compatible timestamp, select the
+    output compression method, and supply the applicable member-path limits.
+
+    Input-specific fields such as CRC, compressed size, uncompressed size,
+    encryption flags, data-descriptor flags, and raw extra records are not
+    copied. ZipFile calculates structural fields when writing the output
+    member.
+    """
+    if compression not in SUPPORTED_ZIP_COMPRESSION:
+        raise ValueError(
+            "Unsupported ZIP compression method for output."
+        )
+
+    candidate_filename = (
+        member.filename
+        if filename is None
+        else filename
+    )
+    output_filename = validate_member_path(
+        candidate_filename,
+        limits=path_limits,
+    )
+
+    output_member = ZipInfo(
+        filename=output_filename,
+        date_time=date_time,
+    )
+    output_member.compress_type = compression
+    output_member.comment = member.comment
+    output_member.create_system = member.create_system
+    output_member.internal_attr = member.internal_attr
+    output_member.external_attr = member.external_attr
+
+    return output_member
+
+
+def write_member_data(
+    archive: ZipFile,
+    member: ZipInfo,
+    data: bytes,
+    *,
+    compression: int,
+    date_time_policy: MemberDateTimePolicy,
+    transformed: bool,
+    path_limits: ArchivePathLimits,
+    filename: str | None = None,
+) -> ZipInfo:
+    """Resolve output metadata and write archive-member data.
+
+    Compression and path limits are selected by the caller. The timestamp is
+    resolved from the supplied policy and transformation state.
+    """
+    date_time = resolve_member_date_time(
+        member,
+        policy=date_time_policy,
+        transformed=transformed,
+    )
+
+    output_member = _clone_member_info(
+        member,
+        date_time=date_time,
+        compression=compression,
+        path_limits=path_limits,
+        filename=filename,
+    )
+
+    archive.writestr(
+        output_member,
+        data,
+    )
+
+    return output_member
+
+
 def verify_archive_integrity(archive: ZipFile) -> None:
     """Verify the CRC and file header of every archive member."""
     corrupt_member = archive.testzip()
@@ -255,10 +495,15 @@ def build_manifest(
     max_total_uncompressed_size: int = (
         DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
     ),
-    max_path_length: int = DEFAULT_MAX_MEMBER_PATH_LENGTH,
-    max_component_length: int = DEFAULT_MAX_PATH_COMPONENT_LENGTH,
+    path_limits: ArchivePathLimits | None = None,
 ) -> ArchiveManifest:
     """Validate an open CBZ archive and describe its contents."""
+    member_path_limits = (
+        ArchivePathLimits()
+        if path_limits is None
+        else path_limits
+    )
+
     if max_files <= 0:
         raise ValueError(
             "Maximum file count must be a positive integer."
@@ -272,16 +517,6 @@ def build_manifest(
     if max_total_uncompressed_size <= 0:
         raise ValueError(
             "Maximum total uncompressed size must be a positive integer."
-        )
-
-    if max_path_length <= 0:
-        raise ValueError(
-            "Maximum member path length must be a positive integer."
-        )
-
-    if max_component_length <= 0:
-        raise ValueError(
-            "Maximum path component length must be a positive integer."
         )
 
     file_members = tuple(
@@ -315,8 +550,7 @@ def build_manifest(
     for member in file_members:
         normalized_path = validate_member_path(
             member.filename,
-            max_path_length=max_path_length,
-            max_component_length=max_component_length,
+            limits=member_path_limits,
         )
 
         if normalized_path in seen_paths:
@@ -376,8 +610,7 @@ def inspect_cbz(
     max_total_uncompressed_size: int = (
         DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
     ),
-    max_path_length: int = DEFAULT_MAX_MEMBER_PATH_LENGTH,
-    max_component_length: int = DEFAULT_MAX_PATH_COMPONENT_LENGTH,
+    path_limits: ArchivePathLimits | None = None,
 ) -> ArchiveManifest:
     """Open, validate, and describe a CBZ archive."""
     if not archive_path.is_file():
@@ -392,8 +625,7 @@ def inspect_cbz(
                 max_files=max_files,
                 max_file_uncompressed_size=max_file_uncompressed_size,
                 max_total_uncompressed_size=max_total_uncompressed_size,
-                max_path_length=max_path_length,
-                max_component_length=max_component_length,
+                path_limits=path_limits,
             )
 
     except BadZipFile as error:
