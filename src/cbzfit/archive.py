@@ -33,7 +33,7 @@ ZipDateTime = tuple[int, int, int, int, int, int]
 
 
 class InvalidArchiveError(ValueError):
-    """Raised when an input archive does not satisfy CBZFit requirements."""
+    """Raised when an archive does not satisfy CBZFit requirements."""
 
 
 class MemberDateTimeMode(StrEnum):

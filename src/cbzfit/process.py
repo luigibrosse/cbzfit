@@ -3,6 +3,7 @@
 import os
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -24,6 +25,7 @@ from cbzfit.archive import (
     MemberDateTimePolicy,
     build_manifest,
     read_member_data,
+    verify_archive_integrity,
     write_member_data,
 )
 from cbzfit.decode import (
@@ -98,6 +100,14 @@ class ArchiveTransformationResult:
     copied_other_members: int
     input_uncompressed_size: int
     output_uncompressed_size: int
+
+
+class OutputVerificationMode(StrEnum):
+    """Define verification performed before publishing an output archive."""
+
+    NONE = "none"
+    STRUCTURE = "structure"
+    CRC = "crc"
 
 
 def process_image_data(
@@ -267,20 +277,73 @@ def transform_archive_contents(
     )
 
 
+def _validate_output_verification_mode(
+    mode: OutputVerificationMode,
+) -> None:
+    """Validate an output verification mode."""
+    if not isinstance(mode, OutputVerificationMode):
+        raise TypeError(
+            "Output verification mode must be an "
+            "OutputVerificationMode, not "
+            f"{type(mode).__name__}."
+        )
+
+
+def _verify_output_archive(
+    archive_path: Path,
+    *,
+    mode: OutputVerificationMode,
+) -> None:
+    """Verify a finalized output archive.
+
+
+    NONE trusts successful ZIP finalization.
+    STRUCTURE reopens and parses the ZIP central directory.
+    CRC additionally reads every member and verifies its CRC.
+    """
+    _validate_output_verification_mode(mode)
+
+    if mode is OutputVerificationMode.NONE:
+        return
+
+    try:
+        with ZipFile(archive_path, mode="r") as archive:
+            if mode is OutputVerificationMode.STRUCTURE:
+                archive.infolist()
+            elif mode is OutputVerificationMode.CRC:
+                verify_archive_integrity(archive)
+            else:  # pragma: no cover - guards future enum members
+                raise ValueError(
+                    f"Unsupported output verification mode: {mode!r}."
+                )
+    except BadZipFile as error:
+        raise InvalidArchiveError(
+            "The transformed output is not a valid ZIP archive."
+        ) from error
+
+
 def process_archive_file(
     source_path: Path,
     destination_path: Path,
     *,
     options: ArchiveTransformationOptions,
+    verification_mode: OutputVerificationMode = (
+        OutputVerificationMode.STRUCTURE
+    ),
 ) -> ArchiveTransformationResult:
-    """Atomically transform one archive file into another.
+    """Atomically transform and optionally verify one archive file.
 
-    The source archive is transformed into a temporary file created beside the
-    destination. After transformation succeeds and both archives are closed,
-    the temporary file is atomically published as the destination.
+    The source archive is transformed into a temporary file created
+    beside the destination. After transformation succeeds and both
+    archives are closed, the temporary archive is verified using the
+    selected mode and atomically published as the destination.
 
-    The temporary file is removed when processing fails before publication.
+    The temporary file is removed when transformation, verification, or
+    publication fails.
     """
+    _validate_output_verification_mode(verification_mode)
+
+
     if not source_path.exists():
         raise FileNotFoundError(
             f"Source archive file does not exist: {source_path}."
@@ -344,6 +407,11 @@ def process_archive_file(
             raise InvalidArchiveError(
                 f"File is not a valid ZIP archive: {source_path}."
             ) from error
+
+        _verify_output_archive(
+            temporary_path,
+            mode=verification_mode,
+        )
 
         os.replace(
             temporary_path,

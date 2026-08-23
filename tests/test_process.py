@@ -1,3 +1,4 @@
+
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
@@ -33,6 +34,7 @@ from cbzfit.process import (
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
     ImageProcessingOptions,
+    OutputVerificationMode,
     ProcessedImage,
     process_archive_file,
     process_image_data,
@@ -924,6 +926,212 @@ class TestArchiveTransformationResult:
         assert result.output_uncompressed_size == 600
 
 
+class TestOutputVerificationMode:
+    def test_supported_modes_have_expected_values(self) -> None:
+        assert OutputVerificationMode.NONE == "none"
+        assert OutputVerificationMode.STRUCTURE == "structure"
+        assert OutputVerificationMode.CRC == "crc"
+
+
+class TestValidateOutputVerificationMode:
+    @pytest.mark.parametrize("mode", list(OutputVerificationMode))
+    def test_supported_mode_is_accepted(
+        self,
+        mode: OutputVerificationMode,
+    ) -> None:
+        process_module._validate_output_verification_mode(mode)
+
+    @pytest.mark.parametrize(
+        ("mode", "type_name"),
+        [
+            ("structure", "str"),
+            (None, "NoneType"),
+            (1, "int"),
+        ],
+    )
+    def test_invalid_mode_type_is_rejected(
+        self,
+        mode: object,
+        type_name: str,
+    ) -> None:
+        expected_message = (
+            "Output verification mode must be an "
+            f"OutputVerificationMode, not {type_name}."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            process_module._validate_output_verification_mode(mode)
+
+
+class TestVerifyOutputArchive:
+    def test_none_mode_does_not_open_archive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        open_archive = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            open_archive,
+        )
+
+        process_module._verify_output_archive(
+            archive_path,
+            mode=OutputVerificationMode.NONE,
+        )
+
+        open_archive.assert_not_called()
+
+    def test_structure_mode_reopens_and_parses_archive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        archive = MagicMock(spec=ZipFile)
+        archive_context = MagicMock()
+        archive_context.__enter__.return_value = archive
+        open_archive = Mock(return_value=archive_context)
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            open_archive,
+        )
+
+        process_module._verify_output_archive(
+            archive_path,
+            mode=OutputVerificationMode.STRUCTURE,
+        )
+
+        open_archive.assert_called_once_with(archive_path, mode="r")
+        archive.infolist.assert_called_once_with()
+        archive_context.__exit__.assert_called_once()
+
+    def test_crc_mode_delegates_integrity_check(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        archive = MagicMock(spec=ZipFile)
+        archive_context = MagicMock()
+        archive_context.__enter__.return_value = archive
+        open_archive = Mock(return_value=archive_context)
+        verify_integrity = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            open_archive,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "verify_archive_integrity",
+            verify_integrity,
+        )
+
+        process_module._verify_output_archive(
+            archive_path,
+            mode=OutputVerificationMode.CRC,
+        )
+
+        open_archive.assert_called_once_with(archive_path, mode="r")
+        verify_integrity.assert_called_once_with(archive)
+        archive.infolist.assert_not_called()
+        archive_context.__exit__.assert_called_once()
+
+    def test_invalid_mode_is_rejected_before_archive_is_opened(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        open_archive = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            open_archive,
+        )
+        expected_message = (
+            "Output verification mode must be an "
+            "OutputVerificationMode, not str."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            process_module._verify_output_archive(
+                archive_path,
+                mode="structure",
+            )
+
+        open_archive.assert_not_called()
+
+    def test_invalid_zip_is_wrapped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        error = BadZipFile("Invalid central directory")
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            Mock(side_effect=error),
+        )
+        expected_message = (
+            "The transformed output is not a valid ZIP archive."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            process_module._verify_output_archive(
+                archive_path,
+                mode=OutputVerificationMode.STRUCTURE,
+            )
+
+        assert exception_info.value.__cause__ is error
+
+    def test_crc_integrity_failure_is_propagated(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        archive = MagicMock(spec=ZipFile)
+        archive_context = MagicMock()
+        archive_context.__enter__.return_value = archive
+        error = InvalidArchiveError(
+            "Archive member failed its integrity check: '002.jpg'."
+        )
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            Mock(return_value=archive_context),
+        )
+        monkeypatch.setattr(
+            process_module,
+            "verify_archive_integrity",
+            Mock(side_effect=error),
+        )
+
+        with pytest.raises(InvalidArchiveError) as exception_info:
+            process_module._verify_output_archive(
+                archive_path,
+                mode=OutputVerificationMode.CRC,
+            )
+
+        assert exception_info.value is error
+        archive_context.__exit__.assert_called_once()
+
+
 class TestTransformArchiveContents:
     def test_mixed_archive_is_transformed_in_original_order(self) -> None:
         large_image = create_encoded_image(
@@ -1663,6 +1871,264 @@ class TestProcessArchiveFile:
         }
         replace.assert_called_once()
         assert destination_path.is_file()
+    @pytest.mark.parametrize(
+        "verification_mode",
+        list(OutputVerificationMode),
+    )
+    def test_archive_is_processed_end_to_end_with_each_verification_mode(
+        self,
+        tmp_path: Path,
+        verification_mode: OutputVerificationMode,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        image_data = create_encoded_image(
+            "PNG",
+            size=(10, 20),
+        )
+        create_archive_file(
+            source_path,
+            [("001.png", image_data)],
+        )
+
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+            verification_mode=verification_mode,
+        )
+
+        assert result == ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=0,
+            unchanged_images=1,
+            copied_other_members=0,
+            input_uncompressed_size=len(image_data),
+            output_uncompressed_size=len(image_data),
+        )
+        assert source_path.is_file()
+        assert destination_path.is_file()
+        assert temporary_archive_paths(destination_path) == []
+
+        with ZipFile(destination_path, mode="r") as destination_archive:
+            assert destination_archive.namelist() == ["001.png"]
+            assert destination_archive.read("001.png") == image_data
+            assert destination_archive.testzip() is None
+
+    @pytest.mark.parametrize(
+        "verification_mode",
+        list(OutputVerificationMode),
+    )
+    def test_selected_verification_mode_is_applied_before_publication(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        verification_mode: OutputVerificationMode,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        options = ArchiveTransformationOptions(
+            image_options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+        expected_result = ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=0,
+            unchanged_images=1,
+            copied_other_members=0,
+            input_uncompressed_size=100,
+            output_uncompressed_size=100,
+        )
+        transform = Mock(return_value=expected_result)
+        events: list[str] = []
+
+        def verify_after_archives_are_closed(
+            archive_path: Path,
+            *,
+            mode: OutputVerificationMode,
+        ) -> None:
+            source_archive, destination_archive = transform.call_args.args
+            assert source_archive.fp is None
+            assert destination_archive.fp is None
+            assert archive_path.is_file()
+            assert mode is verification_mode
+            events.append("verify")
+
+        real_replace = process_module.os.replace
+
+        def publish_after_verification(
+            temporary_path: Path,
+            published_path: Path,
+        ) -> None:
+            events.append("publish")
+            real_replace(temporary_path, published_path)
+
+        verify = Mock(side_effect=verify_after_archives_are_closed)
+        replace = Mock(side_effect=publish_after_verification)
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "_verify_output_archive",
+            verify,
+        )
+        monkeypatch.setattr(
+            process_module.os,
+            "replace",
+            replace,
+        )
+
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=options,
+            verification_mode=verification_mode,
+        )
+
+        assert result is expected_result
+        assert events == ["verify", "publish"]
+        verify.assert_called_once()
+        replace.assert_called_once()
+        assert destination_path.is_file()
+
+    def test_structure_verification_is_used_by_default(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        verify = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "_verify_output_archive",
+            verify,
+        )
+
+        process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+
+        verify.assert_called_once()
+        assert verify.call_args.kwargs == {
+            "mode": OutputVerificationMode.STRUCTURE,
+        }
+
+    def test_invalid_verification_mode_is_rejected_before_file_processing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "missing.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_temporary = Mock()
+        transform = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "NamedTemporaryFile",
+            create_temporary,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
+        )
+        expected_message = (
+            "Output verification mode must be an "
+            "OutputVerificationMode, not str."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                verification_mode="crc",
+            )
+
+        create_temporary.assert_not_called()
+        transform.assert_not_called()
+        assert not destination_path.exists()
+
+    def test_verification_failure_removes_temporary_file_without_publishing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        error = InvalidArchiveError(
+            "The transformed output is not a valid ZIP archive."
+        )
+        verify = Mock(side_effect=error)
+        replace = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "_verify_output_archive",
+            verify,
+        )
+        monkeypatch.setattr(
+            process_module.os,
+            "replace",
+            replace,
+        )
+
+        with pytest.raises(InvalidArchiveError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                verification_mode=OutputVerificationMode.CRC,
+            )
+
+        assert exception_info.value is error
+        verify.assert_called_once()
+        assert verify.call_args.kwargs == {
+            "mode": OutputVerificationMode.CRC,
+        }
+        replace.assert_not_called()
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
+
     def test_missing_source_file_is_rejected(
         self,
         tmp_path: Path,
@@ -1936,6 +2402,84 @@ class TestProcessArchiveFile:
         assert not destination_path.exists()
         assert temporary_archive_paths(destination_path) == []
         transform.assert_called_once()
+
+    def test_destination_zip_finalization_failure_removes_temporary_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        error = OSError("ZIP finalization failed")
+        real_zip_file = process_module.ZipFile
+
+        class FailingDestinationArchive:
+            def __init__(self, archive_path: Path) -> None:
+                self.archive = real_zip_file(archive_path, mode="w")
+
+            def __enter__(self) -> ZipFile:
+                return self.archive
+
+            def __exit__(
+                self,
+                exception_type: object,
+                exception: object,
+                traceback: object,
+            ) -> None:
+                self.archive.close()
+                raise error
+
+        def open_archive(
+            archive_path: Path,
+            *,
+            mode: str,
+        ) -> ZipFile | FailingDestinationArchive:
+            if mode == "w":
+                return FailingDestinationArchive(archive_path)
+            return real_zip_file(archive_path, mode=mode)
+
+        verify = Mock()
+        replace = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            open_archive,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "_verify_output_archive",
+            verify,
+        )
+        monkeypatch.setattr(
+            process_module.os,
+            "replace",
+            replace,
+        )
+
+        with pytest.raises(
+            OSError,
+            match=exact_message("ZIP finalization failed"),
+        ) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert exception_info.value is error
+        verify.assert_not_called()
+        replace.assert_not_called()
+        assert source_path.is_file()
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
 
     def test_publication_failure_removes_temporary_file(
         self,
