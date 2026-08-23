@@ -1,4 +1,3 @@
-
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
@@ -33,6 +32,7 @@ from cbzfit.encode import EncodedImage, EncoderOptions
 from cbzfit.process import (
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
+    DestinationConflictMode,
     ImageProcessingOptions,
     OutputVerificationMode,
     ProcessedImage,
@@ -931,6 +931,167 @@ class TestOutputVerificationMode:
         assert OutputVerificationMode.NONE == "none"
         assert OutputVerificationMode.STRUCTURE == "structure"
         assert OutputVerificationMode.CRC == "crc"
+
+
+class TestDestinationConflictMode:
+    def test_supported_modes_have_expected_values(self) -> None:
+        assert DestinationConflictMode.ERROR == "error"
+        assert DestinationConflictMode.REPLACE == "replace"
+
+
+class TestValidateDestinationConflictMode:
+    @pytest.mark.parametrize("mode", list(DestinationConflictMode))
+    def test_supported_mode_is_accepted(
+        self,
+        mode: DestinationConflictMode,
+    ) -> None:
+        process_module._validate_destination_conflict_mode(mode)
+
+    @pytest.mark.parametrize(
+        ("mode", "type_name"),
+        [
+            ("error", "str"),
+            (None, "NoneType"),
+            (1, "int"),
+        ],
+    )
+    def test_invalid_mode_type_is_rejected(
+        self,
+        mode: object,
+        type_name: str,
+    ) -> None:
+        expected_message = (
+            "Destination conflict mode must be a "
+            f"DestinationConflictMode, not {type_name}."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            process_module._validate_destination_conflict_mode(mode)
+
+
+class TestPublishArchive:
+    def test_error_mode_creates_destination_without_replacement(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        temporary_path = tmp_path / ".output.cbz.temporary.tmp"
+        destination_path = tmp_path / "output.cbz"
+        archive_data = b"completed archive"
+        temporary_path.write_bytes(archive_data)
+
+        process_module._publish_archive(
+            temporary_path,
+            destination_path,
+            conflict_mode=DestinationConflictMode.ERROR,
+        )
+
+        assert destination_path.read_bytes() == archive_data
+        assert not temporary_path.exists()
+
+    def test_error_mode_preserves_destination_created_concurrently(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        temporary_path = tmp_path / ".output.cbz.temporary.tmp"
+        destination_path = tmp_path / "output.cbz"
+        temporary_data = b"completed archive"
+        existing_data = b"concurrent destination"
+        temporary_path.write_bytes(temporary_data)
+        destination_path.write_bytes(existing_data)
+        expected_message = (
+            f"Destination archive already exists: {destination_path}."
+        )
+
+        with pytest.raises(
+            FileExistsError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            process_module._publish_archive(
+                temporary_path,
+                destination_path,
+                conflict_mode=DestinationConflictMode.ERROR,
+            )
+
+        assert isinstance(exception_info.value.__cause__, FileExistsError)
+        assert destination_path.read_bytes() == existing_data
+        assert temporary_path.read_bytes() == temporary_data
+
+    def test_error_mode_suppresses_temporary_unlink_failure_after_linking(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        temporary_path = tmp_path / ".output.cbz.temporary.tmp"
+        destination_path = tmp_path / "output.cbz"
+        archive_data = b"completed archive"
+        temporary_path.write_bytes(archive_data)
+        error = OSError("Temporary link removal failed")
+        unlink = Mock(side_effect=error)
+
+        with monkeypatch.context() as unlink_patch:
+            unlink_patch.setattr(process_module.Path, "unlink", unlink)
+            process_module._publish_archive(
+                temporary_path,
+                destination_path,
+                conflict_mode=DestinationConflictMode.ERROR,
+            )
+
+        assert destination_path.read_bytes() == archive_data
+        assert temporary_path.exists()
+        unlink.assert_called_once_with()
+
+    def test_replace_mode_atomically_replaces_existing_destination(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        temporary_path = tmp_path / ".output.cbz.temporary.tmp"
+        destination_path = tmp_path / "output.cbz"
+        temporary_path.write_bytes(b"replacement archive")
+        destination_path.write_bytes(b"existing archive")
+
+        process_module._publish_archive(
+            temporary_path,
+            destination_path,
+            conflict_mode=DestinationConflictMode.REPLACE,
+        )
+
+        assert destination_path.read_bytes() == b"replacement archive"
+        assert not temporary_path.exists()
+
+    def test_invalid_mode_is_rejected_before_publication(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        temporary_path = tmp_path / ".output.cbz.temporary.tmp"
+        destination_path = tmp_path / "output.cbz"
+        temporary_path.write_bytes(b"completed archive")
+        link = Mock()
+        replace = Mock()
+        monkeypatch.setattr(process_module.os, "link", link)
+        monkeypatch.setattr(process_module.os, "replace", replace)
+        expected_message = (
+            "Destination conflict mode must be a "
+            "DestinationConflictMode, not str."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            process_module._publish_archive(
+                temporary_path,
+                destination_path,
+                conflict_mode="error",
+            )
+
+        link.assert_not_called()
+        replace.assert_not_called()
+        assert temporary_path.exists()
+        assert not destination_path.exists()
 
 
 class TestValidateOutputVerificationMode:
@@ -1835,27 +1996,36 @@ class TestProcessArchiveFile:
             output_uncompressed_size=100,
         )
         transform = Mock(return_value=expected_result)
+        real_publish = process_module._publish_archive
+
+        def publish_after_archives_are_closed(
+            temporary_path: Path,
+            published_path: Path,
+            *,
+            conflict_mode: DestinationConflictMode,
+        ) -> None:
+            source_archive, destination_archive = transform.call_args.args
+            assert source_archive.fp is None
+            assert destination_archive.fp is None
+            assert temporary_path.is_file()
+            assert published_path == destination_path
+            assert conflict_mode is DestinationConflictMode.ERROR
+            real_publish(
+                temporary_path,
+                published_path,
+                conflict_mode=conflict_mode,
+            )
+
+        publish = Mock(side_effect=publish_after_archives_are_closed)
         monkeypatch.setattr(
             process_module,
             "transform_archive_contents",
             transform,
         )
-        real_replace = process_module.os.replace
-
-        def replace_after_archives_are_closed(
-            temporary_path: Path,
-            published_path: Path,
-        ) -> None:
-            source_archive, destination_archive = transform.call_args.args
-            assert source_archive.fp is None
-            assert destination_archive.fp is None
-            real_replace(temporary_path, published_path)
-
-        replace = Mock(side_effect=replace_after_archives_are_closed)
         monkeypatch.setattr(
-            process_module.os,
-            "replace",
-            replace,
+            process_module,
+            "_publish_archive",
+            publish,
         )
 
         result = process_archive_file(
@@ -1866,10 +2036,8 @@ class TestProcessArchiveFile:
 
         assert result is expected_result
         transform.assert_called_once()
-        assert transform.call_args.kwargs == {
-            "options": options,
-        }
-        replace.assert_called_once()
+        assert transform.call_args.kwargs == {"options": options}
+        publish.assert_called_once()
         assert destination_path.is_file()
     @pytest.mark.parametrize(
         "verification_mode",
@@ -1951,6 +2119,7 @@ class TestProcessArchiveFile:
             output_uncompressed_size=100,
         )
         transform = Mock(return_value=expected_result)
+        real_publish = process_module._publish_archive
         events: list[str] = []
 
         def verify_after_archives_are_closed(
@@ -1965,17 +2134,21 @@ class TestProcessArchiveFile:
             assert mode is verification_mode
             events.append("verify")
 
-        real_replace = process_module.os.replace
-
         def publish_after_verification(
             temporary_path: Path,
             published_path: Path,
+            *,
+            conflict_mode: DestinationConflictMode,
         ) -> None:
             events.append("publish")
-            real_replace(temporary_path, published_path)
+            real_publish(
+                temporary_path,
+                published_path,
+                conflict_mode=conflict_mode,
+            )
 
         verify = Mock(side_effect=verify_after_archives_are_closed)
-        replace = Mock(side_effect=publish_after_verification)
+        publish = Mock(side_effect=publish_after_verification)
         monkeypatch.setattr(
             process_module,
             "transform_archive_contents",
@@ -1987,9 +2160,9 @@ class TestProcessArchiveFile:
             verify,
         )
         monkeypatch.setattr(
-            process_module.os,
-            "replace",
-            replace,
+            process_module,
+            "_publish_archive",
+            publish,
         )
 
         result = process_archive_file(
@@ -2002,9 +2175,8 @@ class TestProcessArchiveFile:
         assert result is expected_result
         assert events == ["verify", "publish"]
         verify.assert_called_once()
-        replace.assert_called_once()
+        publish.assert_called_once()
         assert destination_path.is_file()
-
     def test_structure_verification_is_used_by_default(
         self,
         tmp_path: Path,
@@ -2096,17 +2268,9 @@ class TestProcessArchiveFile:
             "The transformed output is not a valid ZIP archive."
         )
         verify = Mock(side_effect=error)
-        replace = Mock()
-        monkeypatch.setattr(
-            process_module,
-            "_verify_output_archive",
-            verify,
-        )
-        monkeypatch.setattr(
-            process_module.os,
-            "replace",
-            replace,
-        )
+        publish = Mock()
+        monkeypatch.setattr(process_module, "_verify_output_archive", verify)
+        monkeypatch.setattr(process_module, "_publish_archive", publish)
 
         with pytest.raises(InvalidArchiveError) as exception_info:
             process_archive_file(
@@ -2125,10 +2289,9 @@ class TestProcessArchiveFile:
         assert verify.call_args.kwargs == {
             "mode": OutputVerificationMode.CRC,
         }
-        replace.assert_not_called()
+        publish.assert_not_called()
         assert not destination_path.exists()
         assert temporary_archive_paths(destination_path) == []
-
     def test_missing_source_file_is_rejected(
         self,
         tmp_path: Path,
@@ -2251,7 +2414,8 @@ class TestProcessArchiveFile:
         )
         destination_path = tmp_path / "." / "source.cbz"
         expected_message = (
-            "Source and destination archive paths must be different."
+            "Source and destination archive paths must be different "
+            "unless destination replacement is enabled."
         )
 
         with pytest.raises(
@@ -2269,7 +2433,6 @@ class TestProcessArchiveFile:
             )
 
         assert source_path.is_file()
-
     def test_destination_directory_is_rejected(
         self,
         tmp_path: Path,
@@ -2302,6 +2465,7 @@ class TestProcessArchiveFile:
     def test_existing_destination_file_is_not_replaced(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         source_path = tmp_path / "source.cbz"
         destination_path = tmp_path / "output.cbz"
@@ -2313,6 +2477,20 @@ class TestProcessArchiveFile:
         destination_path.write_bytes(original_destination_data)
         expected_message = (
             f"Destination archive already exists: {destination_path}."
+        )
+
+        create_temporary = Mock()
+        transform = Mock()
+
+        monkeypatch.setattr(
+            process_module,
+            "NamedTemporaryFile",
+            create_temporary,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
         )
 
         with pytest.raises(
@@ -2331,6 +2509,140 @@ class TestProcessArchiveFile:
 
         assert destination_path.read_bytes() == original_destination_data
         assert temporary_archive_paths(destination_path) == []
+        create_temporary.assert_not_called()
+        transform.assert_not_called()
+
+    def test_existing_destination_is_replaced_when_enabled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        image_data = create_encoded_image("PNG")
+        create_archive_file(source_path, [("001.png", image_data)])
+        destination_path.write_bytes(b"existing destination")
+
+        process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+            conflict_mode=DestinationConflictMode.REPLACE,
+        )
+
+        with ZipFile(destination_path, mode="r") as archive:
+            assert archive.namelist() == ["001.png"]
+            assert archive.read("001.png") == image_data
+        assert temporary_archive_paths(destination_path) == []
+
+    def test_in_place_processing_succeeds_when_replacement_is_enabled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "source.cbz"
+        large_image = create_encoded_image("PNG", size=(20, 40))
+        create_archive_file(archive_path, [("001.png", large_image)])
+        original_data = archive_path.read_bytes()
+
+        result = process_archive_file(
+            archive_path,
+            archive_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+            conflict_mode=DestinationConflictMode.REPLACE,
+        )
+
+        assert archive_path.read_bytes() != original_data
+        assert result.transformed_images == 1
+        with (
+            ZipFile(archive_path, mode="r") as archive,
+            open_encoded_image(archive.read("001.png")) as image,
+        ):
+            assert image.size == (10, 20)
+        assert temporary_archive_paths(archive_path) == []
+
+    def test_in_place_failure_preserves_original_archive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "source.cbz"
+        create_archive_file(
+            archive_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        original_data = archive_path.read_bytes()
+        error = RuntimeError("Transformation failed")
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            Mock(side_effect=error),
+        )
+
+        with pytest.raises(RuntimeError) as exception_info:
+            process_archive_file(
+                archive_path,
+                archive_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+
+        assert exception_info.value is error
+        assert archive_path.read_bytes() == original_data
+        assert temporary_archive_paths(archive_path) == []
+
+    def test_invalid_conflict_mode_is_rejected_before_file_processing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "missing.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_temporary = Mock()
+        transform = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "NamedTemporaryFile",
+            create_temporary,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
+        )
+        expected_message = (
+            "Destination conflict mode must be a "
+            "DestinationConflictMode, not str."
+        )
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode="replace",
+            )
+
+        create_temporary.assert_not_called()
+        transform.assert_not_called()
+        assert not destination_path.exists()
 
     def test_invalid_zip_is_wrapped_and_temporary_file_is_removed(
         self,
@@ -2443,22 +2755,10 @@ class TestProcessArchiveFile:
             return real_zip_file(archive_path, mode=mode)
 
         verify = Mock()
-        replace = Mock()
-        monkeypatch.setattr(
-            process_module,
-            "ZipFile",
-            open_archive,
-        )
-        monkeypatch.setattr(
-            process_module,
-            "_verify_output_archive",
-            verify,
-        )
-        monkeypatch.setattr(
-            process_module.os,
-            "replace",
-            replace,
-        )
+        publish = Mock()
+        monkeypatch.setattr(process_module, "ZipFile", open_archive)
+        monkeypatch.setattr(process_module, "_verify_output_archive", verify)
+        monkeypatch.setattr(process_module, "_publish_archive", publish)
 
         with pytest.raises(
             OSError,
@@ -2476,11 +2776,10 @@ class TestProcessArchiveFile:
 
         assert exception_info.value is error
         verify.assert_not_called()
-        replace.assert_not_called()
+        publish.assert_not_called()
         assert source_path.is_file()
         assert not destination_path.exists()
         assert temporary_archive_paths(destination_path) == []
-
     def test_publication_failure_removes_temporary_file(
         self,
         tmp_path: Path,
@@ -2492,13 +2791,9 @@ class TestProcessArchiveFile:
             source_path,
             [("001.png", create_encoded_image("PNG"))],
         )
-        error = OSError("Atomic replacement failed")
-        replace = Mock(side_effect=error)
-        monkeypatch.setattr(
-            process_module.os,
-            "replace",
-            replace,
-        )
+        error = OSError("Atomic publication failed")
+        publish = Mock(side_effect=error)
+        monkeypatch.setattr(process_module, "_publish_archive", publish)
 
         with pytest.raises(OSError) as exception_info:
             process_archive_file(
@@ -2514,15 +2809,16 @@ class TestProcessArchiveFile:
         assert exception_info.value is error
         assert not destination_path.exists()
         assert temporary_archive_paths(destination_path) == []
-        replace.assert_called_once()
-        temporary_path, published_path = replace.call_args.args
+        publish.assert_called_once()
+        temporary_path, published_path = publish.call_args.args
         temporary_path = Path(temporary_path)
         assert temporary_path.parent == destination_path.parent
-        assert temporary_path.name.startswith(
-            f".{destination_path.name}."
-        )
+        assert temporary_path.name.startswith(f".{destination_path.name}.")
         assert temporary_path.suffix == ".tmp"
         assert published_path == destination_path
+        assert publish.call_args.kwargs == {
+            "conflict_mode": DestinationConflictMode.ERROR,
+        }
     def test_temporary_cleanup_failure_does_not_hide_original_error(
         self,
         tmp_path: Path,
@@ -2595,3 +2891,135 @@ class TestProcessArchiveFile:
 
         assert exception_info.value is error
         assert not destination_path.exists()
+
+    def test_destination_created_during_processing_is_preserved(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        concurrent_data = b"concurrent destination"
+
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+
+        real_publish = process_module._publish_archive
+
+        def create_destination_before_publication(
+            temporary_path: Path,
+            published_path: Path,
+            *,
+            conflict_mode: DestinationConflictMode,
+        ) -> None:
+            published_path.write_bytes(concurrent_data)
+            real_publish(
+                temporary_path,
+                published_path,
+                conflict_mode=conflict_mode,
+            )
+
+        monkeypatch.setattr(
+            process_module,
+            "_publish_archive",
+            create_destination_before_publication,
+        )
+
+        expected_message = (
+            f"Destination archive already exists: {destination_path}."
+        )
+
+        with pytest.raises(
+            FileExistsError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert isinstance(exception_info.value.__cause__, FileExistsError)
+        assert destination_path.read_bytes() == concurrent_data
+        assert temporary_archive_paths(destination_path) == []
+
+    def test_in_place_verification_failure_preserves_original_archive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "source.cbz"
+        create_archive_file(
+            archive_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        original_data = archive_path.read_bytes()
+        error = InvalidArchiveError(
+            "The transformed output is not a valid ZIP archive."
+        )
+
+        monkeypatch.setattr(
+            process_module,
+            "_verify_output_archive",
+            Mock(side_effect=error),
+        )
+
+        with pytest.raises(InvalidArchiveError) as exception_info:
+            process_archive_file(
+                archive_path,
+                archive_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+
+        assert exception_info.value is error
+        assert archive_path.read_bytes() == original_data
+        assert temporary_archive_paths(archive_path) == []
+
+    def test_replacement_failure_preserves_existing_destination(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        existing_data = b"existing destination"
+
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        destination_path.write_bytes(existing_data)
+
+        error = OSError("Atomic replacement failed")
+        monkeypatch.setattr(
+            process_module.os,
+            "replace",
+            Mock(side_effect=error),
+        )
+
+        with pytest.raises(OSError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+
+        assert exception_info.value is error
+        assert destination_path.read_bytes() == existing_data
+        assert temporary_archive_paths(destination_path) == []

@@ -110,6 +110,13 @@ class OutputVerificationMode(StrEnum):
     CRC = "crc"
 
 
+class DestinationConflictMode(StrEnum):
+    """Define how an existing destination archive is handled."""
+
+    ERROR = "error"
+    REPLACE = "replace"
+
+
 def process_image_data(
     data: bytes,
     filename: str,
@@ -322,6 +329,65 @@ def _verify_output_archive(
         ) from error
 
 
+def _validate_destination_conflict_mode(
+    mode: DestinationConflictMode,
+) -> None:
+    """Validate a destination conflict mode."""
+    if not isinstance(mode, DestinationConflictMode):
+        raise TypeError(
+            "Destination conflict mode must be a "
+            "DestinationConflictMode, not "
+            f"{type(mode).__name__}."
+        )
+
+
+def _publish_archive(
+    temporary_path: Path,
+    destination_path: Path,
+    *,
+    conflict_mode: DestinationConflictMode,
+) -> None:
+    """Atomically publish a completed temporary archive.
+
+    ERROR creates the destination only when it does not already exist.
+    REPLACE atomically replaces an existing destination.
+
+    Both paths must reside on the same filesystem.
+    """
+    _validate_destination_conflict_mode(conflict_mode)
+
+    if conflict_mode is DestinationConflictMode.ERROR:
+        try:
+            os.link(
+                temporary_path,
+                destination_path,
+            )
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"Destination archive already exists: {destination_path}."
+            ) from error
+
+        # The destination now references the complete temporary archive.
+        # Failure to remove the temporary link must not turn a successful
+        # publication into a reported processing failure.
+        with suppress(OSError):
+            temporary_path.unlink()
+
+        return
+
+    if conflict_mode is DestinationConflictMode.REPLACE:
+        os.replace(
+            temporary_path,
+            destination_path,
+        )
+        return
+
+    # Defensive guard against a future enum member that is not implemented.
+    raise ValueError(  # pragma: no cover
+        f"Unsupported destination conflict mode: {conflict_mode!r}."
+    )
+
+
 def process_archive_file(
     source_path: Path,
     destination_path: Path,
@@ -330,19 +396,25 @@ def process_archive_file(
     verification_mode: OutputVerificationMode = (
         OutputVerificationMode.STRUCTURE
     ),
+    conflict_mode: DestinationConflictMode = (
+        DestinationConflictMode.ERROR
+    ),
 ) -> ArchiveTransformationResult:
-    """Atomically transform and optionally verify one archive file.
+    """Atomically transform, verify, and publish one archive file.
 
-    The source archive is transformed into a temporary file created
-    beside the destination. After transformation succeeds and both
-    archives are closed, the temporary archive is verified using the
-    selected mode and atomically published as the destination.
+    The source archive is transformed into a temporary file created beside the
+    destination. After transformation succeeds and both archives are closed,
+    the temporary archive is verified using the selected verification mode.
+
+    ERROR publishes the result only when the destination does not exist.
+    REPLACE atomically replaces an existing destination and permits source and
+    destination to refer to the same file.
 
     The temporary file is removed when transformation, verification, or
     publication fails.
     """
     _validate_output_verification_mode(verification_mode)
-
+    _validate_destination_conflict_mode(conflict_mode)
 
     if not source_path.exists():
         raise FileNotFoundError(
@@ -368,9 +440,18 @@ def process_archive_file(
             f"{destination_parent}."
         )
 
-    if source_path.resolve() == destination_path.resolve():
+    paths_are_equivalent = (
+        source_path.resolve()
+        == destination_path.resolve()
+    )
+
+    if (
+        paths_are_equivalent
+        and conflict_mode is DestinationConflictMode.ERROR
+    ):
         raise ValueError(
-            "Source and destination archive paths must be different."
+            "Source and destination archive paths must be different "
+            "unless destination replacement is enabled."
         )
 
     if destination_path.is_dir():
@@ -378,7 +459,10 @@ def process_archive_file(
             f"Destination path is a directory: {destination_path}."
         )
 
-    if destination_path.exists():
+    if (
+        destination_path.exists()
+        and conflict_mode is DestinationConflictMode.ERROR
+    ):
         raise FileExistsError(
             f"Destination archive already exists: {destination_path}."
         )
@@ -413,9 +497,10 @@ def process_archive_file(
             mode=verification_mode,
         )
 
-        os.replace(
+        _publish_archive(
             temporary_path,
             destination_path,
+            conflict_mode=conflict_mode,
         )
     except BaseException:
         with suppress(OSError):
