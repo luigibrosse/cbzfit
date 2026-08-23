@@ -2,8 +2,14 @@
 
 import re
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import MagicMock, Mock
-from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
+from zipfile import (
+    ZIP_DEFLATED,
+    ZIP_STORED,
+    BadZipFile,
+    ZipFile,
+)
 
 import pytest
 from PIL import Image, UnidentifiedImageError
@@ -28,6 +34,7 @@ from cbzfit.process import (
     ArchiveTransformationResult,
     ImageProcessingOptions,
     ProcessedImage,
+    process_archive_file,
     process_image_data,
     transform_archive_contents,
 )
@@ -98,6 +105,25 @@ def create_mock_opened_image() -> MagicMock:
     image.size = (10, 20)
 
     return image
+
+
+def create_archive_file(
+    archive_path: Path,
+    members: list[tuple[str, bytes]],
+) -> None:
+    """Create a ZIP archive at the selected path."""
+    with ZipFile(archive_path, mode="w") as archive:
+        for filename, data in members:
+            archive.writestr(filename, data)
+
+
+def temporary_archive_paths(destination_path: Path) -> list[Path]:
+    """Return temporary archive paths associated with a destination."""
+    return list(
+        destination_path.parent.glob(
+            f".{destination_path.name}.*.tmp"
+        )
+    )
 
 
 class TestImageProcessingOptions:
@@ -1500,3 +1526,528 @@ class TestTransformArchiveContents:
         assert read.call_count == 1
         assert process_image.call_count == 1
         assert write.call_count == 1
+
+
+class TestProcessArchiveFile:
+    def test_archive_file_is_processed_and_published_atomically(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        large_image = create_encoded_image(
+            "JPEG",
+            size=(20, 40),
+        )
+        unchanged_image = create_encoded_image(
+            "PNG",
+            size=(10, 20),
+        )
+        metadata = b"<ComicInfo><Title>Example</Title></ComicInfo>"
+        create_archive_file(
+            source_path,
+            [
+                ("001.jpg", large_image),
+                ("ComicInfo.xml", metadata),
+                ("002.png", unchanged_image),
+            ],
+        )
+        source_bytes = source_path.read_bytes()
+
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+                date_time_policy=MemberDateTimePolicy(
+                    mode=MemberDateTimeMode.FIXED,
+                    fixed_date_time=(2000, 1, 2, 3, 4, 6),
+                ),
+            ),
+        )
+
+        assert source_path.read_bytes() == source_bytes
+        assert destination_path.is_file()
+        assert temporary_archive_paths(destination_path) == []
+
+        with ZipFile(destination_path, mode="r") as destination:
+            assert destination.namelist() == [
+                "001.jpg",
+                "ComicInfo.xml",
+                "002.png",
+            ]
+            transformed_image = destination.read("001.jpg")
+            assert destination.read("ComicInfo.xml") == metadata
+            assert destination.read("002.png") == unchanged_image
+            with open_encoded_image(transformed_image) as image:
+                assert image.size == (10, 20)
+
+        assert result == ArchiveTransformationResult(
+            total_file_members=3,
+            image_members=2,
+            transformed_images=1,
+            unchanged_images=1,
+            copied_other_members=1,
+            input_uncompressed_size=(
+                len(large_image)
+                + len(metadata)
+                + len(unchanged_image)
+            ),
+            output_uncompressed_size=(
+                len(transformed_image)
+                + len(metadata)
+                + len(unchanged_image)
+            ),
+        )
+    def test_transformation_result_is_returned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        options = ArchiveTransformationOptions(
+            image_options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+        expected_result = ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=0,
+            unchanged_images=1,
+            copied_other_members=0,
+            input_uncompressed_size=100,
+            output_uncompressed_size=100,
+        )
+        transform = Mock(return_value=expected_result)
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
+        )
+        real_replace = process_module.os.replace
+
+        def replace_after_archives_are_closed(
+            temporary_path: Path,
+            published_path: Path,
+        ) -> None:
+            source_archive, destination_archive = transform.call_args.args
+            assert source_archive.fp is None
+            assert destination_archive.fp is None
+            real_replace(temporary_path, published_path)
+
+        replace = Mock(side_effect=replace_after_archives_are_closed)
+        monkeypatch.setattr(
+            process_module.os,
+            "replace",
+            replace,
+        )
+
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=options,
+        )
+
+        assert result is expected_result
+        transform.assert_called_once()
+        assert transform.call_args.kwargs == {
+            "options": options,
+        }
+        replace.assert_called_once()
+        assert destination_path.is_file()
+    def test_missing_source_file_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "missing.cbz"
+        destination_path = tmp_path / "output.cbz"
+        expected_message = (
+            f"Source archive file does not exist: {source_path}."
+        )
+
+        with pytest.raises(
+            FileNotFoundError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert not destination_path.exists()
+
+    def test_source_directory_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        source_path.mkdir()
+        destination_path = tmp_path / "output.cbz"
+        expected_message = (
+            f"Source archive path is not a file: {source_path}."
+        )
+
+        with pytest.raises(
+            IsADirectoryError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+    def test_missing_destination_directory_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        destination_parent = tmp_path / "missing"
+        destination_path = destination_parent / "output.cbz"
+        expected_message = (
+            f"Destination directory does not exist: {destination_parent}."
+        )
+
+        with pytest.raises(
+            FileNotFoundError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+    def test_destination_parent_file_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        destination_parent = tmp_path / "not-a-directory"
+        destination_parent.write_bytes(b"file")
+        destination_path = destination_parent / "output.cbz"
+        expected_message = (
+            "Destination parent is not a directory: "
+            f"{destination_parent}."
+        )
+
+        with pytest.raises(
+            NotADirectoryError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+    def test_equivalent_source_and_destination_paths_are_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        destination_path = tmp_path / "." / "source.cbz"
+        expected_message = (
+            "Source and destination archive paths must be different."
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert source_path.is_file()
+
+    def test_destination_directory_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        destination_path = tmp_path / "output.cbz"
+        destination_path.mkdir()
+        expected_message = (
+            f"Destination path is a directory: {destination_path}."
+        )
+
+        with pytest.raises(
+            IsADirectoryError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+    def test_existing_destination_file_is_not_replaced(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        original_destination_data = b"existing destination"
+        destination_path.write_bytes(original_destination_data)
+        expected_message = (
+            f"Destination archive already exists: {destination_path}."
+        )
+
+        with pytest.raises(
+            FileExistsError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert destination_path.read_bytes() == original_destination_data
+        assert temporary_archive_paths(destination_path) == []
+
+    def test_invalid_zip_is_wrapped_and_temporary_file_is_removed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "invalid.cbz"
+        destination_path = tmp_path / "output.cbz"
+        source_path.write_bytes(b"not a ZIP archive")
+        expected_message = (
+            f"File is not a valid ZIP archive: {source_path}."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert isinstance(exception_info.value.__cause__, BadZipFile)
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("Transformation failed"),
+            KeyboardInterrupt(),
+        ],
+    )
+    def test_transformation_failure_removes_temporary_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        error: BaseException,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        transform = Mock(side_effect=error)
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
+        )
+
+        with pytest.raises(type(error)) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert exception_info.value is error
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
+        transform.assert_called_once()
+
+    def test_publication_failure_removes_temporary_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        error = OSError("Atomic replacement failed")
+        replace = Mock(side_effect=error)
+        monkeypatch.setattr(
+            process_module.os,
+            "replace",
+            replace,
+        )
+
+        with pytest.raises(OSError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert exception_info.value is error
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
+        replace.assert_called_once()
+        temporary_path, published_path = replace.call_args.args
+        temporary_path = Path(temporary_path)
+        assert temporary_path.parent == destination_path.parent
+        assert temporary_path.name.startswith(
+            f".{destination_path.name}."
+        )
+        assert temporary_path.suffix == ".tmp"
+        assert published_path == destination_path
+    def test_temporary_cleanup_failure_does_not_hide_original_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        original_error = RuntimeError("Transformation failed")
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            Mock(side_effect=original_error),
+        )
+        unlink = Mock(side_effect=OSError("Cleanup failed"))
+
+        with monkeypatch.context() as cleanup_patch:
+            cleanup_patch.setattr(
+                process_module.Path,
+                "unlink",
+                unlink,
+            )
+            with pytest.raises(RuntimeError) as exception_info:
+                process_archive_file(
+                    source_path,
+                    destination_path,
+                    options=ArchiveTransformationOptions(
+                        image_options=ImageProcessingOptions(
+                            portrait_screen_size=(10, 20),
+                        ),
+                    ),
+                )
+
+        assert exception_info.value is original_error
+        unlink.assert_called_once_with(missing_ok=True)
+
+    def test_temporary_file_creation_failure_is_propagated(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+
+        error = PermissionError("Temporary file creation failed")
+
+        monkeypatch.setattr(
+            process_module,
+            "NamedTemporaryFile",
+            Mock(side_effect=error),
+        )
+
+        with pytest.raises(PermissionError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        assert exception_info.value is error
+        assert not destination_path.exists()

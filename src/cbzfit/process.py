@@ -1,8 +1,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import os
+from contextlib import suppress
 from dataclasses import dataclass, field
 from io import BytesIO
-from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from zipfile import (
+    ZIP_DEFLATED,
+    ZIP_STORED,
+    BadZipFile,
+    ZipFile,
+)
 
 from PIL import Image, UnidentifiedImageError
 
@@ -11,6 +20,7 @@ from cbzfit.archive import (
     ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
+    InvalidArchiveError,
     MemberDateTimePolicy,
     build_manifest,
     read_member_data,
@@ -255,3 +265,93 @@ def transform_archive_contents(
         input_uncompressed_size=read_state.total_size,
         output_uncompressed_size=output_uncompressed_size,
     )
+
+
+def process_archive_file(
+    source_path: Path,
+    destination_path: Path,
+    *,
+    options: ArchiveTransformationOptions,
+) -> ArchiveTransformationResult:
+    """Atomically transform one archive file into another.
+
+    The source archive is transformed into a temporary file created beside the
+    destination. After transformation succeeds and both archives are closed,
+    the temporary file is atomically published as the destination.
+
+    The temporary file is removed when processing fails before publication.
+    """
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"Source archive file does not exist: {source_path}."
+        )
+
+    if not source_path.is_file():
+        raise IsADirectoryError(
+            f"Source archive path is not a file: {source_path}."
+        )
+
+    destination_parent = destination_path.parent
+
+    if not destination_parent.exists():
+        raise FileNotFoundError(
+            "Destination directory does not exist: "
+            f"{destination_parent}."
+        )
+
+    if not destination_parent.is_dir():
+        raise NotADirectoryError(
+            "Destination parent is not a directory: "
+            f"{destination_parent}."
+        )
+
+    if source_path.resolve() == destination_path.resolve():
+        raise ValueError(
+            "Source and destination archive paths must be different."
+        )
+
+    if destination_path.is_dir():
+        raise IsADirectoryError(
+            f"Destination path is a directory: {destination_path}."
+        )
+
+    if destination_path.exists():
+        raise FileExistsError(
+            f"Destination archive already exists: {destination_path}."
+        )
+
+    with NamedTemporaryFile(
+        mode="w+b",
+        prefix=f".{destination_path.name}.",
+        suffix=".tmp",
+        dir=destination_parent,
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+
+    try:
+        try:
+            with (
+                ZipFile(source_path, mode="r") as source_archive,
+                ZipFile(temporary_path, mode="w") as destination_archive,
+            ):
+                result = transform_archive_contents(
+                    source_archive,
+                    destination_archive,
+                    options=options,
+                )
+        except BadZipFile as error:
+            raise InvalidArchiveError(
+                f"File is not a valid ZIP archive: {source_path}."
+            ) from error
+
+        os.replace(
+            temporary_path,
+            destination_path,
+        )
+    except BaseException:
+        with suppress(OSError):
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+    return result
