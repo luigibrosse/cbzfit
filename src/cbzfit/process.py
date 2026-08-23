@@ -40,30 +40,6 @@ class ImageProcessingOptions:
 
 
 @dataclass(frozen=True)
-class ArchiveProcessingOptions:
-    """Store settings used to transform one CBZ archive."""
-
-    image_options: ImageProcessingOptions
-    max_files: int = DEFAULT_MAX_ARCHIVE_FILES
-    read_limits: ArchiveReadLimits = field(
-        default_factory=ArchiveReadLimits
-    )
-    path_limits: ArchivePathLimits = field(
-        default_factory=ArchivePathLimits
-    )
-    date_time_policy: MemberDateTimePolicy = field(
-        default_factory=MemberDateTimePolicy
-    )
-
-    def __post_init__(self) -> None:
-        """Validate archive-processing settings."""
-        if self.max_files <= 0:
-            raise ValueError(
-                "Maximum file count must be a positive integer."
-            )
-
-
-@dataclass(frozen=True)
 class ProcessedImage:
     """Contain processed image data and transformation details."""
 
@@ -78,8 +54,32 @@ class ProcessedImage:
 
 
 @dataclass(frozen=True)
-class ArchiveProcessingResult:
-    """Summarize one transformed CBZ archive."""
+class ArchiveTransformationOptions:
+    """Store settings used to transform archive contents."""
+
+    image_options: ImageProcessingOptions
+    max_files: int = DEFAULT_MAX_ARCHIVE_FILES
+    read_limits: ArchiveReadLimits = field(
+        default_factory=ArchiveReadLimits
+    )
+    path_limits: ArchivePathLimits = field(
+        default_factory=ArchivePathLimits
+    )
+    date_time_policy: MemberDateTimePolicy = field(
+        default_factory=MemberDateTimePolicy
+    )
+
+    def __post_init__(self) -> None:
+        """Validate archive-transformation settings."""
+        if self.max_files <= 0:
+            raise ValueError(
+                "Maximum file count must be a positive integer."
+            )
+
+
+@dataclass(frozen=True)
+class ArchiveTransformationResult:
+    """Summarize transformed archive contents."""
 
     total_file_members: int
     image_members: int
@@ -161,13 +161,13 @@ def process_image_data(
     )
 
 
-def process_cbz_archive(
+def transform_archive_contents(
     source_archive: ZipFile,
     destination_archive: ZipFile,
     *,
-    options: ArchiveProcessingOptions,
-) -> ArchiveProcessingResult:
-    """Transform the contents of one open CBZ archive.
+    options: ArchiveTransformationOptions,
+) -> ArchiveTransformationResult:
+    """Transform contents between two open ZIP archives.
 
     Supported image members are validated, resized when required, and written
     without additional ZIP compression. Other members are copied unchanged
@@ -246,7 +246,7 @@ def process_cbz_archive(
 
         output_uncompressed_size += len(output_data)
 
-    return ArchiveProcessingResult(
+    return ArchiveTransformationResult(
         total_file_members=len(manifest.file_members),
         image_members=manifest.image_count,
         transformed_images=transformed_images,

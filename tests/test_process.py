@@ -24,12 +24,12 @@ from cbzfit.decode import (
 )
 from cbzfit.encode import EncodedImage, EncoderOptions
 from cbzfit.process import (
-    ArchiveProcessingOptions,
-    ArchiveProcessingResult,
+    ArchiveTransformationOptions,
+    ArchiveTransformationResult,
     ImageProcessingOptions,
     ProcessedImage,
-    process_cbz_archive,
     process_image_data,
+    transform_archive_contents,
 )
 
 
@@ -803,13 +803,13 @@ class TestProcessImageData:
         encode.assert_not_called()
 
 
-class TestArchiveProcessingOptions:
+class TestArchiveTransformationOptions:
     def test_default_options_are_created(self) -> None:
         image_options = ImageProcessingOptions(
             portrait_screen_size=(1404, 1872),
         )
 
-        options = ArchiveProcessingOptions(
+        options = ArchiveTransformationOptions(
             image_options=image_options,
         )
 
@@ -824,8 +824,8 @@ class TestArchiveProcessingOptions:
             portrait_screen_size=(1404, 1872),
         )
 
-        first = ArchiveProcessingOptions(image_options=image_options)
-        second = ArchiveProcessingOptions(image_options=image_options)
+        first = ArchiveTransformationOptions(image_options=image_options)
+        second = ArchiveTransformationOptions(image_options=image_options)
 
         assert first.read_limits is not second.read_limits
         assert first.path_limits is not second.path_limits
@@ -848,7 +848,7 @@ class TestArchiveProcessingOptions:
             fixed_date_time=(2000, 1, 2, 3, 4, 6),
         )
 
-        options = ArchiveProcessingOptions(
+        options = ArchiveTransformationOptions(
             image_options=image_options,
             max_files=10,
             read_limits=read_limits,
@@ -869,7 +869,7 @@ class TestArchiveProcessingOptions:
             ValueError,
             match=exact_message(expected_message),
         ):
-            ArchiveProcessingOptions(
+            ArchiveTransformationOptions(
                 image_options=ImageProcessingOptions(
                     portrait_screen_size=(1404, 1872),
                 ),
@@ -877,9 +877,9 @@ class TestArchiveProcessingOptions:
             )
 
 
-class TestArchiveProcessingResult:
+class TestArchiveTransformationResult:
     def test_result_fields_are_retained(self) -> None:
-        result = ArchiveProcessingResult(
+        result = ArchiveTransformationResult(
             total_file_members=4,
             image_members=3,
             transformed_images=2,
@@ -898,7 +898,7 @@ class TestArchiveProcessingResult:
         assert result.output_uncompressed_size == 600
 
 
-class TestProcessCbzArchive:
+class TestTransformArchiveContents:
     def test_mixed_archive_is_transformed_in_original_order(self) -> None:
         large_image = create_encoded_image(
             "JPEG",
@@ -922,10 +922,10 @@ class TestProcessCbzArchive:
             ZipFile(source_stream, mode="r") as source,
             ZipFile(destination_stream, mode="w") as destination,
         ):
-            result = process_cbz_archive(
+            result = transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
@@ -960,7 +960,7 @@ class TestProcessCbzArchive:
             with open_encoded_image(destination.read("001.jpg")) as image:
                 assert image.size == (10, 20)
 
-        assert result == ArchiveProcessingResult(
+        assert result == ArchiveTransformationResult(
             total_file_members=3,
             image_members=2,
             transformed_images=1,
@@ -1031,10 +1031,10 @@ class TestProcessCbzArchive:
             mode=MemberDateTimeMode.MODIFIED,
         )
 
-        result = process_cbz_archive(
+        result = transform_archive_contents(
             source,
             destination,
-            options=ArchiveProcessingOptions(
+            options=ArchiveTransformationOptions(
                 image_options=ImageProcessingOptions(
                     portrait_screen_size=(10, 20),
                 ),
@@ -1143,7 +1143,7 @@ class TestProcessCbzArchive:
         policy = MemberDateTimePolicy(
             mode=MemberDateTimeMode.PRESERVE,
         )
-        options = ArchiveProcessingOptions(
+        options = ArchiveTransformationOptions(
             image_options=image_options,
             max_files=5,
             read_limits=read_limits,
@@ -1151,7 +1151,7 @@ class TestProcessCbzArchive:
             date_time_policy=policy,
         )
 
-        result = process_cbz_archive(
+        result = transform_archive_contents(
             source,
             destination,
             options=options,
@@ -1219,7 +1219,7 @@ class TestProcessCbzArchive:
             "path_limits": path_limits,
         }
 
-        assert result == ArchiveProcessingResult(
+        assert result == ArchiveTransformationResult(
             total_file_members=2,
             image_members=1,
             transformed_images=1,
@@ -1259,10 +1259,10 @@ class TestProcessCbzArchive:
                 ),
             ),
         ):
-            process_cbz_archive(
+            transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
@@ -1293,10 +1293,10 @@ class TestProcessCbzArchive:
                 ),
             ),
         ):
-            process_cbz_archive(
+            transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
@@ -1326,10 +1326,10 @@ class TestProcessCbzArchive:
                 ),
             ),
         ):
-            process_cbz_archive(
+            transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
@@ -1366,10 +1366,10 @@ class TestProcessCbzArchive:
                 ),
             ),
         ):
-            process_cbz_archive(
+            transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
@@ -1406,10 +1406,10 @@ class TestProcessCbzArchive:
                 ),
             ),
         ):
-            process_cbz_archive(
+            transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
@@ -1486,10 +1486,10 @@ class TestProcessCbzArchive:
             OSError,
             match=exact_message("Archive write failed"),
         ) as exception_info:
-            process_cbz_archive(
+            transform_archive_contents(
                 source,
                 destination,
-                options=ArchiveProcessingOptions(
+                options=ArchiveTransformationOptions(
                     image_options=ImageProcessingOptions(
                         portrait_screen_size=(10, 20),
                     ),
