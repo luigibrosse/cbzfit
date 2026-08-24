@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+
 import argparse
 from pathlib import Path
 
 from cbzfit import __version__
 from cbzfit.process import (
+    ArchiveTransformationOptions,
     DestinationConflictMode,
+    ImageProcessingOptions,
     OutputVerificationMode,
+    process_archive_file,
 )
 
 
@@ -32,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cbzfit",
         description="Resize manga CBZ archives to fit a target display.",
     )
+
     parser.add_argument(
         "source",
         type=Path,
@@ -104,11 +109,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"%(prog)s {__version__}",
     )
+
     return parser
 
 
 def main() -> int:
     """Run the CBZFit command-line interface."""
     parser = build_parser()
-    parser.parse_args()
+    arguments = parser.parse_args()
+
+    image_options = ImageProcessingOptions(
+        portrait_screen_size=(
+            arguments.screen_width,
+            arguments.screen_height,
+        ),
+        use_landscape_display=arguments.landscape_display,
+        allow_upscale=arguments.upscale,
+    )
+    transformation_options = ArchiveTransformationOptions(
+        image_options=image_options,
+    )
+
+    process_archive_file(
+        arguments.source,
+        arguments.destination,
+        options=transformation_options,
+        verification_mode=arguments.verification_mode,
+        conflict_mode=arguments.conflict_mode,
+    )
+
     return 0

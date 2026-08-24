@@ -3,14 +3,21 @@
 import argparse
 import re
 import sys
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock
+from zipfile import ZipFile
 
 import pytest
+from PIL import Image
 
+import cbzfit.cli as cli_module
 from cbzfit import __version__
 from cbzfit.cli import build_parser, main, positive_integer
 from cbzfit.process import (
+    ArchiveTransformationOptions,
     DestinationConflictMode,
+    ImageProcessingOptions,
     OutputVerificationMode,
 )
 
@@ -379,11 +386,94 @@ class TestBuildParser:
 
 
 class TestMain:
+    @pytest.mark.parametrize(
+        (
+            "additional_arguments",
+            "expected_image_options",
+            "expected_verification_mode",
+            "expected_conflict_mode",
+        ),
+        [
+            (
+                [],
+                ImageProcessingOptions(
+                    portrait_screen_size=(1404, 1872),
+                ),
+                OutputVerificationMode.STRUCTURE,
+                DestinationConflictMode.ERROR,
+            ),
+            (
+                [
+                    "--no-landscape-display",
+                    "--upscale",
+                    "--verify",
+                    "crc",
+                    "--conflict",
+                    "replace",
+                ],
+                ImageProcessingOptions(
+                    portrait_screen_size=(1404, 1872),
+                    use_landscape_display=False,
+                    allow_upscale=True,
+                ),
+                OutputVerificationMode.CRC,
+                DestinationConflictMode.REPLACE,
+            ),
+        ],
+    )
+    def test_processing_options_are_constructed_and_forwarded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        additional_arguments: list[str],
+        expected_image_options: ImageProcessingOptions,
+        expected_verification_mode: OutputVerificationMode,
+        expected_conflict_mode: DestinationConflictMode,
+    ) -> None:
+        source_path = Path("source.cbz")
+        destination_path = Path("destination.cbz")
+        process_archive = Mock()
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_archive,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                *required_arguments(),
+                *additional_arguments,
+            ],
+        )
 
-    def test_valid_arguments_return_success(
+        result = main()
+
+        assert result == 0
+        process_archive.assert_called_once()
+        assert process_archive.call_args.args == (
+            source_path,
+            destination_path,
+        )
+        assert process_archive.call_args.kwargs == {
+            "options": ArchiveTransformationOptions(
+                image_options=expected_image_options,
+            ),
+            "verification_mode": expected_verification_mode,
+            "conflict_mode": expected_conflict_mode,
+        }
+
+    def test_processing_error_is_propagated(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        error = RuntimeError("Processing failed")
+        process_archive = Mock(side_effect=error)
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_archive,
+        )
         monkeypatch.setattr(
             sys,
             "argv",
@@ -393,4 +483,61 @@ class TestMain:
             ],
         )
 
-        assert main() == 0
+        with pytest.raises(RuntimeError) as exception_info:
+            main()
+
+        assert exception_info.value is error
+        process_archive.assert_called_once()
+
+    def test_archive_is_processed_end_to_end(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        source_image = Image.new(
+            mode="RGB",
+            size=(20, 40),
+            color="white",
+        )
+        image_stream = BytesIO()
+        try:
+            source_image.save(image_stream, format="PNG")
+        finally:
+            source_image.close()
+        source_image_data = image_stream.getvalue()
+
+        with ZipFile(source_path, mode="w") as source_archive:
+            source_archive.writestr("001.png", source_image_data)
+
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                str(destination_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--verify",
+                "crc",
+            ],
+        )
+
+        result = main()
+
+        assert result == 0
+        assert source_path.is_file()
+        assert destination_path.is_file()
+        with ZipFile(destination_path, mode="r") as destination_archive:
+            assert destination_archive.namelist() == ["001.png"]
+            assert destination_archive.testzip() is None
+            with Image.open(
+                BytesIO(destination_archive.read("001.png"))
+            ) as output_image:
+                output_image.load()
+                assert output_image.format == "PNG"
+                assert output_image.size == (10, 20)
