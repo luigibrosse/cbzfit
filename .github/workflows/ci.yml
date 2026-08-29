@@ -49,8 +49,8 @@ jobs:
           --cov-report=term-missing
           --cov-fail-under=100
 
-  build:
-    name: Build package
+  package-smoke-test:
+    name: Package smoke test
     runs-on: ubuntu-latest
 
     steps:
@@ -68,3 +68,55 @@ jobs:
 
       - name: Build source and wheel distributions
         run: python -m build
+
+      - name: Create clean environment
+        run: python -m venv .package-smoke
+
+      - name: Install built wheel
+        run: .package-smoke/bin/python -m pip install dist/*.whl
+
+      - name: Verify installed entry points
+        run: |
+          test "$(.package-smoke/bin/cbzfit --version)" = "cbzfit 0.1.0"
+          test "$(.package-smoke/bin/python -m cbzfit --version)" = "cbzfit 0.1.0"
+
+      - name: Process a generated CBZ with installed command
+        run: |
+          .package-smoke/bin/python - <<'PY'
+          from io import BytesIO
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from PIL import Image
+
+          image_stream = BytesIO()
+          with Image.new("RGB", (20, 40), "white") as image:
+              image.save(image_stream, format="PNG")
+
+          with ZipFile("smoke-source.cbz", mode="w") as archive:
+              archive.writestr("001.png", image_stream.getvalue())
+          PY
+          .package-smoke/bin/cbzfit \
+            smoke-source.cbz \
+            smoke-output.cbz \
+            --screen-width 10 \
+            --screen-height 20 \
+            --verify crc
+          .package-smoke/bin/python - <<'PY'
+          from io import BytesIO
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from PIL import Image
+
+          output_path = Path("smoke-output.cbz")
+          assert output_path.is_file()
+
+          with ZipFile(output_path, mode="r") as archive:
+              assert archive.testzip() is None
+              assert archive.namelist() == ["001.png"]
+              with Image.open(BytesIO(archive.read("001.png"))) as image:
+                  image.load()
+                  assert image.format == "PNG"
+                  assert image.size == (10, 20)
+          PY
