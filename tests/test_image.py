@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 from PIL import Image, ImageCms
 
+import cbzfit.image as image_module
 from cbzfit.decode import UnsupportedImageFormatError
 from cbzfit.image import (
     InvalidScreenDimensionError,
@@ -895,3 +896,119 @@ class TestPrepareImageForFormat:
         assert result.image is image
         assert result.image.mode == "RGB"
         assert result.icc_profile is None
+
+    def test_opaque_incompatible_image_is_converted_to_rgb_for_jpeg(
+        self,
+    ) -> None:
+        image = Image.new(
+            mode="HSV",
+            size=(10, 20),
+            color=(0, 0, 255),
+        )
+
+        result = prepare_image_for_format(
+            image,
+            output_format="JPEG",
+            preserve_icc_profile=False,
+        )
+
+        assert result.image is not image
+        assert result.image.mode == "RGB"
+        assert result.image.size == image.size
+        assert result.icc_profile is None
+
+    @pytest.mark.parametrize(
+        ("output_format", "has_transparency", "expected_mode"),
+        [
+            ("PNG", True, "RGBA"),
+            ("PNG", False, "RGB"),
+            ("WEBP", True, "RGBA"),
+            ("WEBP", False, "RGB"),
+        ],
+    )
+    def test_incompatible_image_is_converted_for_output_format(
+        self,
+        output_format: str,
+        has_transparency: bool,
+        expected_mode: str,
+    ) -> None:
+        image = Mock(spec=Image.Image)
+        image.mode = "HSV"
+        image.info = {}
+        image.has_transparency_data = has_transparency
+
+        compatible_image = Mock(spec=Image.Image)
+        compatible_image.mode = expected_mode
+        image.convert.return_value = compatible_image
+
+        result = prepare_image_for_format(
+            image,
+            output_format=output_format,
+            preserve_icc_profile=False,
+        )
+
+        assert result.image is compatible_image
+        assert result.icc_profile is None
+        image.convert.assert_called_once_with(expected_mode)
+
+    def test_cmyk_conversion_returns_generated_icc_profile(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        image = Mock(spec=Image.Image)
+        image.mode = "CMYK"
+        image.info = {"icc_profile": b"source-icc-profile"}
+
+        converted_image = Mock(spec=Image.Image)
+        converted_image.mode = "RGB"
+        converted = PreparedImage(
+            image=converted_image,
+            icc_profile=b"generated-srgb-profile",
+        )
+        convert = Mock(return_value=converted)
+        monkeypatch.setattr(
+            image_module,
+            "convert_cmyk_to_rgb",
+            convert,
+        )
+
+        result = prepare_image_for_format(
+            image,
+            output_format="JPEG",
+            preserve_icc_profile=True,
+        )
+
+        assert result == converted
+        convert.assert_called_once_with(
+            image,
+            preserve_icc_profile=True,
+        )
+
+    def test_recognized_but_unimplemented_format_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        image = Mock(spec=Image.Image)
+        image.mode = "RGB"
+        image.info = {}
+        output_format = "__UNIMPLEMENTED_IMAGE_FORMAT__"
+        expected_message = (
+            f"Unsupported image format: {output_format!r}."
+        )
+
+        monkeypatch.setattr(
+            image_module,
+            "normalize_image_format",
+            lambda image_format: output_format,
+        )
+
+        with pytest.raises(
+            UnsupportedImageFormatError,
+            match=exact_message(expected_message),
+        ):
+            prepare_image_for_format(
+                image,
+                output_format=output_format,
+                preserve_icc_profile=False,
+            )
+

@@ -378,14 +378,14 @@ def resolve_member_date_time(
         return validate_zip_date_time(member.date_time)
 
     if policy.mode is MemberDateTimeMode.FIXED:
-        if policy.fixed_date_time is None:
+        if policy.fixed_date_time is None:  # pragma: no cover - validated by policy
             raise RuntimeError(
                 "Fixed timestamp policy does not contain a timestamp."
             )
 
         return policy.fixed_date_time
 
-    raise ValueError(
+    raise ValueError(  # pragma: no cover - guards future enum members
         f"Unsupported archive-member timestamp mode: {policy.mode!r}."
     )
 
