@@ -36,6 +36,7 @@ from cbzfit.process import (
     ImageProcessingOptions,
     OutputVerificationMode,
     ProcessedImage,
+    SourceDestinationConflictError,
     process_archive_file,
     process_image_data,
     transform_archive_contents,
@@ -45,6 +46,11 @@ from cbzfit.process import (
 def exact_message(message: str) -> str:
     """Return a regular expression that matches a complete error message."""
     return rf"^{re.escape(message)}$"
+
+
+class TestSourceDestinationConflictError:
+    def test_error_is_a_value_error(self) -> None:
+        assert issubclass(SourceDestinationConflictError, ValueError)
 
 
 def create_encoded_image(
@@ -2406,6 +2412,7 @@ class TestProcessArchiveFile:
     def test_equivalent_source_and_destination_paths_are_rejected(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         source_path = tmp_path / "source.cbz"
         create_archive_file(
@@ -2417,11 +2424,23 @@ class TestProcessArchiveFile:
             "Source and destination archive paths must be different "
             "unless destination replacement is enabled."
         )
+        create_temporary = Mock()
+        transform = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "NamedTemporaryFile",
+            create_temporary,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform,
+        )
 
         with pytest.raises(
-            ValueError,
+            SourceDestinationConflictError,
             match=exact_message(expected_message),
-        ):
+        ) as exception_info:
             process_archive_file(
                 source_path,
                 destination_path,
@@ -2432,7 +2451,11 @@ class TestProcessArchiveFile:
                 ),
             )
 
+        assert isinstance(exception_info.value, ValueError)
         assert source_path.is_file()
+        assert temporary_archive_paths(destination_path) == []
+        create_temporary.assert_not_called()
+        transform.assert_not_called()
     def test_destination_directory_is_rejected(
         self,
         tmp_path: Path,

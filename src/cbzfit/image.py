@@ -11,6 +11,14 @@ from cbzfit.decode import (
 )
 
 
+class InvalidScreenDimensionError(ValueError):
+    """Raised when a target-screen dimension is not positive."""
+
+
+class InvalidScreenOrientationError(ValueError):
+    """Raised when screen dimensions are not in portrait orientation."""
+
+
 @dataclass(frozen=True)
 class PreparedImage:
     """Contain a format-compatible image and optional ICC profile."""
@@ -71,12 +79,12 @@ def calculate_display_fit(
     screen_width, screen_height = portrait_screen_size
 
     if screen_width <= 0 or screen_height <= 0:
-        raise ValueError(
+        raise InvalidScreenDimensionError(
             "Screen dimensions must be positive integers."
         )
 
     if screen_width > screen_height:
-        raise ValueError(
+        raise InvalidScreenOrientationError(
             "Screen size must be provided in portrait orientation."
         )
 

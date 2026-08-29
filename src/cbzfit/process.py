@@ -39,6 +39,10 @@ from cbzfit.encode import (
 from cbzfit.image import resize_for_display
 
 
+class SourceDestinationConflictError(ValueError):
+    """Raised when equivalent source and destination paths conflict."""
+
+
 @dataclass(frozen=True)
 class ImageProcessingOptions:
     """Store settings used to process one image."""
@@ -449,7 +453,7 @@ def process_archive_file(
         paths_are_equivalent
         and conflict_mode is DestinationConflictMode.ERROR
     ):
-        raise ValueError(
+        raise SourceDestinationConflictError(
             "Source and destination archive paths must be different "
             "unless destination replacement is enabled."
         )

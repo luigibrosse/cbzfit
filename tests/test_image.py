@@ -8,6 +8,8 @@ from PIL import Image, ImageCms
 
 from cbzfit.decode import UnsupportedImageFormatError
 from cbzfit.image import (
+    InvalidScreenDimensionError,
+    InvalidScreenOrientationError,
     PreparedImage,
     calculate_display_fit,
     convert_cmyk_to_rgb,
@@ -22,6 +24,16 @@ from cbzfit.image import (
 def exact_message(message: str) -> str:
     """Return a regular expression that matches a complete error message."""
     return rf"^{re.escape(message)}$"
+
+
+class TestInvalidScreenDimensionError:
+    def test_error_is_a_value_error(self) -> None:
+        assert issubclass(InvalidScreenDimensionError, ValueError)
+
+
+class TestInvalidScreenOrientationError:
+    def test_error_is_a_value_error(self) -> None:
+        assert issubclass(InvalidScreenOrientationError, ValueError)
 
 class TestFitSizeWithin:
 
@@ -192,13 +204,15 @@ class TestCalculateDisplayFit:
         )
 
         with pytest.raises(
-            ValueError,
+            InvalidScreenDimensionError,
             match=exact_message(expected_message),
-        ):
+        ) as exception_info:
             calculate_display_fit(
                 original_size=(2297, 3247),
                 portrait_screen_size=portrait_screen_size,
             )
+
+        assert isinstance(exception_info.value, ValueError)
 
 
     def test_landscape_screen_dimensions_are_rejected(self) -> None:
@@ -207,13 +221,15 @@ class TestCalculateDisplayFit:
         )
 
         with pytest.raises(
-            ValueError,
+            InvalidScreenOrientationError,
             match=exact_message(expected_message),
-        ):
+        ) as exception_info:
             calculate_display_fit(
                 original_size=(2297, 3247),
                 portrait_screen_size=(1872, 1404),
             )
+
+        assert isinstance(exception_info.value, ValueError)
 
 class TestResizeForDisplay:
 
