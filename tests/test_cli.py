@@ -13,9 +13,23 @@ from PIL import Image
 
 import cbzfit.cli as cli_module
 from cbzfit import __version__
-from cbzfit.cli import build_parser, main, positive_integer
+from cbzfit.archive import (
+    InvalidArchiveError,
+)
+from cbzfit.cli import (
+    build_parser,
+    format_count,
+    main,
+    positive_integer,
+    print_processing_summary,
+)
+from cbzfit.decode import (
+    UnsupportedImageContentError,
+    UnsupportedImageFormatError,
+)
 from cbzfit.process import (
     ArchiveTransformationOptions,
+    ArchiveTransformationResult,
     DestinationConflictMode,
     ImageProcessingOptions,
     OutputVerificationMode,
@@ -385,6 +399,130 @@ class TestBuildParser:
         assert unknown_option in error_output
 
 
+class TestFormatCount:
+    @pytest.mark.parametrize(
+        ("singular", "count", "expected"),
+        [
+            ("Image", 0, "Images"),
+            ("Image", 1, "Image"),
+            ("Image", 2, "Images"),
+            ("Other member", 0, "Other members"),
+            ("Other member", 1, "Other member"),
+            ("Other member", 2, "Other members"),
+        ],
+    )
+    def test_count_is_formatted_with_the_expected_noun(
+        self,
+        singular: str,
+        count: int,
+        expected: str,
+    ) -> None:
+        assert format_count(singular, count) == expected
+
+    @pytest.mark.parametrize("count", [-1, -2])
+    def test_negative_count_is_rejected(
+        self,
+        count: int,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message("Count must not be negative."),
+        ):
+            format_count("Image", count)
+
+
+class TestPrintProcessingSummary:
+    @pytest.mark.parametrize(
+        ("result", "expected_summary"),
+        [
+            (
+                ArchiveTransformationResult(
+                    total_file_members=300,
+                    image_members=200,
+                    transformed_images=100,
+                    unchanged_images=100,
+                    copied_other_members=100,
+                    input_uncompressed_size=1_000,
+                    output_uncompressed_size=600,
+                ),
+                (
+                    "Output: optimized.cbz\n"
+                    "└─Images: 200 total, 100 transformed, "
+                    "100 unchanged. Other members copied: 100\n"
+                ),
+            ),
+            (
+                ArchiveTransformationResult(
+                    total_file_members=2,
+                    image_members=1,
+                    transformed_images=1,
+                    unchanged_images=0,
+                    copied_other_members=1,
+                    input_uncompressed_size=100,
+                    output_uncompressed_size=80,
+                ),
+                (
+                    "Output: optimized.cbz\n"
+                    "└─Image: 1 total, 1 transformed, "
+                    "0 unchanged. Other member copied: 1\n"
+                ),
+            ),
+            (
+                ArchiveTransformationResult(
+                    total_file_members=0,
+                    image_members=0,
+                    transformed_images=0,
+                    unchanged_images=0,
+                    copied_other_members=0,
+                    input_uncompressed_size=0,
+                    output_uncompressed_size=0,
+                ),
+                (
+                    "Output: optimized.cbz\n"
+                    "└─Images: 0 total, 0 transformed, "
+                    "0 unchanged. Other members copied: 0\n"
+                ),
+            ),
+        ],
+    )
+    def test_exact_two_line_summary_is_printed(
+        self,
+        result: ArchiveTransformationResult,
+        expected_summary: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        print_processing_summary(
+            Path("optimized.cbz"),
+            result,
+        )
+
+        captured = capsys.readouterr()
+
+        assert captured.out == expected_summary
+        assert captured.err == ""
+
+    def test_destination_path_is_preserved_in_summary(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        destination = Path("Output") / "Manga Volume 01.cbz"
+        result = ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=0,
+            unchanged_images=1,
+            copied_other_members=0,
+            input_uncompressed_size=100,
+            output_uncompressed_size=100,
+        )
+
+        print_processing_summary(destination, result)
+
+        assert capsys.readouterr().out.startswith(
+            f"Output: {destination}\n"
+        )
+
+
 class TestMain:
     @pytest.mark.parametrize(
         (
@@ -421,7 +559,7 @@ class TestMain:
             ),
         ],
     )
-    def test_processing_options_are_constructed_and_forwarded(
+    def test_processing_options_and_result_are_forwarded(
         self,
         monkeypatch: pytest.MonkeyPatch,
         additional_arguments: list[str],
@@ -431,11 +569,26 @@ class TestMain:
     ) -> None:
         source_path = Path("source.cbz")
         destination_path = Path("destination.cbz")
-        process_archive = Mock()
+        processing_result = ArchiveTransformationResult(
+            total_file_members=3,
+            image_members=2,
+            transformed_images=1,
+            unchanged_images=1,
+            copied_other_members=1,
+            input_uncompressed_size=1_000,
+            output_uncompressed_size=600,
+        )
+        process_archive = Mock(return_value=processing_result)
+        print_summary = Mock()
         monkeypatch.setattr(
             cli_module,
             "process_archive_file",
             process_archive,
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
         )
         monkeypatch.setattr(
             sys,
@@ -462,17 +615,80 @@ class TestMain:
             "verification_mode": expected_verification_mode,
             "conflict_mode": expected_conflict_mode,
         }
+        print_summary.assert_called_once_with(
+            destination_path,
+            processing_result,
+        )
 
-    def test_processing_error_is_propagated(
+    @pytest.mark.parametrize(
+        "error",
+        [
+            InvalidArchiveError("Archive validation failed"),
+            UnsupportedImageContentError("Image content is unsupported"),
+            UnsupportedImageFormatError("Image format is unsupported"),
+            FileNotFoundError("Source archive is missing"),
+            FileExistsError("Destination archive already exists"),
+            IsADirectoryError("Archive path is a directory"),
+            NotADirectoryError("Archive parent is not a directory"),
+            PermissionError("Archive access was denied"),
+            OSError("Archive filesystem operation failed"),
+        ],
+    )
+    def test_expected_processing_error_is_reported_without_traceback(
         self,
+        error: Exception,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        error = RuntimeError("Processing failed")
         process_archive = Mock(side_effect=error)
+        print_summary = Mock()
         monkeypatch.setattr(
             cli_module,
             "process_archive_file",
             process_archive,
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                *required_arguments(),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == f"cbzfit: error: {error}\n"
+        assert "Traceback" not in captured.err
+        process_archive.assert_called_once()
+        print_summary.assert_not_called()
+
+    def test_unexpected_processing_error_is_propagated(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        error = RuntimeError("Unexpected processing failure")
+        process_archive = Mock(side_effect=error)
+        print_summary = Mock()
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_archive,
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
         )
         monkeypatch.setattr(
             sys,
@@ -486,13 +702,18 @@ class TestMain:
         with pytest.raises(RuntimeError) as exception_info:
             main()
 
+        captured = capsys.readouterr()
         assert exception_info.value is error
+        assert captured.out == ""
+        assert captured.err == ""
         process_archive.assert_called_once()
+        print_summary.assert_not_called()
 
     def test_archive_is_processed_end_to_end(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         source_path = tmp_path / "source.cbz"
         destination_path = tmp_path / "destination.cbz"
@@ -510,7 +731,9 @@ class TestMain:
 
         with ZipFile(source_path, mode="w") as source_archive:
             source_archive.writestr("001.png", source_image_data)
+            source_archive.writestr("ComicInfo.xml", b"<ComicInfo />")
 
+        source_archive_data = source_path.read_bytes()
         monkeypatch.setattr(
             sys,
             "argv",
@@ -529,12 +752,24 @@ class TestMain:
 
         result = main()
 
+        captured = capsys.readouterr()
         assert result == 0
-        assert source_path.is_file()
+        assert captured.out == (
+            f"Output: {destination_path}\n"
+            "└─Image: 1 total, 1 transformed, 0 unchanged. "
+            "Other member copied: 1\n"
+        )
+        assert captured.err == ""
+        assert source_path.read_bytes() == source_archive_data
         assert destination_path.is_file()
+        assert list(tmp_path.glob(f".{destination_path.name}.*.tmp")) == []
         with ZipFile(destination_path, mode="r") as destination_archive:
-            assert destination_archive.namelist() == ["001.png"]
+            assert destination_archive.namelist() == [
+                "001.png",
+                "ComicInfo.xml",
+            ]
             assert destination_archive.testzip() is None
+            assert destination_archive.read("ComicInfo.xml") == b"<ComicInfo />"
             with Image.open(
                 BytesIO(destination_archive.read("001.png"))
             ) as output_image:

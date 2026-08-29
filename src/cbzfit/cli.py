@@ -4,8 +4,16 @@ import argparse
 from pathlib import Path
 
 from cbzfit import __version__
+from cbzfit.archive import (
+    InvalidArchiveError,
+)
+from cbzfit.decode import (
+    UnsupportedImageContentError,
+    UnsupportedImageFormatError,
+)
 from cbzfit.process import (
     ArchiveTransformationOptions,
+    ArchiveTransformationResult,
     DestinationConflictMode,
     ImageProcessingOptions,
     OutputVerificationMode,
@@ -113,6 +121,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def format_count(
+    singular: str,
+    count: int,
+) -> str:
+    """Return a singular or plural noun based on a non-negative count."""
+    if count < 0:
+        raise ValueError("Count must not be negative.")
+        
+    return singular if count == 1 else f"{singular}s"
+
+
+def print_processing_summary(
+    destination: Path,
+    result: ArchiveTransformationResult,
+) -> None:
+    """Print a concise archive-processing summary."""
+    image_members = result.image_members
+    transformed_images = result.transformed_images
+    unchanged_images = result.unchanged_images
+    copied_other_members = result.copied_other_members
+
+    print(f"Output: {destination}")
+    print(
+        f"└─{format_count('Image', image_members)}: "
+        f"{image_members} total, "
+        f"{transformed_images} transformed, "
+        f"{unchanged_images} unchanged. "
+        f"{format_count('Other member', copied_other_members)} copied: "
+        f"{copied_other_members}"
+    )
+
+
 def main() -> int:
     """Run the CBZFit command-line interface."""
     parser = build_parser()
@@ -130,12 +170,28 @@ def main() -> int:
         image_options=image_options,
     )
 
-    process_archive_file(
-        arguments.source,
+    try:
+        result = process_archive_file(
+            arguments.source,
+            arguments.destination,
+            options=transformation_options,
+            verification_mode=arguments.verification_mode,
+            conflict_mode=arguments.conflict_mode,
+        )
+    except (
+        InvalidArchiveError,
+        UnsupportedImageContentError,
+        UnsupportedImageFormatError,
+        OSError,
+    ) as error:
+        parser.exit(
+            status=1,
+            message=f"{parser.prog}: error: {error}\n",
+        )
+
+    print_processing_summary(
         arguments.destination,
-        options=transformation_options,
-        verification_mode=arguments.verification_mode,
-        conflict_mode=arguments.conflict_mode,
+        result,
     )
 
     return 0
