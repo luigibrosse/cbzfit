@@ -36,7 +36,10 @@ from cbzfit.encode import (
     EncoderOptions,
     encode_image,
 )
-from cbzfit.image import resize_for_display
+from cbzfit.image import (
+    resize_for_display,
+    validate_portrait_screen_size,
+)
 
 
 class SourceDestinationConflictError(ValueError):
@@ -53,6 +56,12 @@ class ImageProcessingOptions:
     encoder_options: EncoderOptions = field(
         default_factory=EncoderOptions
     )
+
+    def __post_init__(self) -> None:
+        """Validate image-processing settings."""
+        validate_portrait_screen_size(
+            self.portrait_screen_size
+        )
 
 
 @dataclass(frozen=True)

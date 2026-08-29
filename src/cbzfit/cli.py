@@ -11,12 +11,17 @@ from cbzfit.decode import (
     UnsupportedImageContentError,
     UnsupportedImageFormatError,
 )
+from cbzfit.image import (
+    InvalidScreenDimensionError,
+    InvalidScreenOrientationError,
+)
 from cbzfit.process import (
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
     DestinationConflictMode,
     ImageProcessingOptions,
     OutputVerificationMode,
+    SourceDestinationConflictError,
     process_archive_file,
 )
 
@@ -158,19 +163,18 @@ def main() -> int:
     parser = build_parser()
     arguments = parser.parse_args()
 
-    image_options = ImageProcessingOptions(
-        portrait_screen_size=(
-            arguments.screen_width,
-            arguments.screen_height,
-        ),
-        use_landscape_display=arguments.landscape_display,
-        allow_upscale=arguments.upscale,
-    )
-    transformation_options = ArchiveTransformationOptions(
-        image_options=image_options,
-    )
-
     try:
+        image_options = ImageProcessingOptions(
+            portrait_screen_size=(
+                arguments.screen_width,
+                arguments.screen_height,
+            ),
+            use_landscape_display=arguments.landscape_display,
+            allow_upscale=arguments.upscale,
+        )
+        transformation_options = ArchiveTransformationOptions(
+            image_options=image_options,
+        )
         result = process_archive_file(
             arguments.source,
             arguments.destination,
@@ -180,6 +184,9 @@ def main() -> int:
         )
     except (
         InvalidArchiveError,
+        InvalidScreenDimensionError,
+        InvalidScreenOrientationError,
+        SourceDestinationConflictError,
         UnsupportedImageContentError,
         UnsupportedImageFormatError,
         OSError,

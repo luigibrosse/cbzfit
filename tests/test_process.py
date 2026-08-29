@@ -29,6 +29,10 @@ from cbzfit.decode import (
     UnsupportedImageFormatError,
 )
 from cbzfit.encode import EncodedImage, EncoderOptions
+from cbzfit.image import (
+    InvalidScreenDimensionError,
+    InvalidScreenOrientationError,
+)
 from cbzfit.process import (
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
@@ -181,6 +185,63 @@ class TestImageProcessingOptions:
             first_options.encoder_options
             is not second_options.encoder_options
         )
+
+
+    @pytest.mark.parametrize(
+        "screen_size",
+        [
+            (0, 1872),
+            (1404, 0),
+            (-1, 1872),
+            (1404, -1),
+        ],
+    )
+    def test_non_positive_screen_dimension_is_rejected(
+        self,
+        screen_size: tuple[int, int],
+    ) -> None:
+        expected_message = (
+            "Screen dimensions must be positive integers."
+        )
+
+        with pytest.raises(
+            InvalidScreenDimensionError,
+            match=exact_message(expected_message),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=screen_size,
+            )
+
+    def test_landscape_screen_orientation_is_rejected(self) -> None:
+        expected_message = (
+            "Screen size must be provided in portrait orientation."
+        )
+
+        with pytest.raises(
+            InvalidScreenOrientationError,
+            match=exact_message(expected_message),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1872, 1404),
+            )
+
+    def test_screen_size_is_validated_during_construction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        validate = Mock(return_value=(1404, 1872))
+        monkeypatch.setattr(
+            process_module,
+            "validate_portrait_screen_size",
+            validate,
+        )
+
+        options = ImageProcessingOptions(
+            portrait_screen_size=(1404, 1872),
+        )
+
+        assert options.portrait_screen_size == (1404, 1872)
+        validate.assert_called_once_with((1404, 1872))
 
 
 class TestProcessedImage:

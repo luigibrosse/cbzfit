@@ -27,12 +27,17 @@ from cbzfit.decode import (
     UnsupportedImageContentError,
     UnsupportedImageFormatError,
 )
+from cbzfit.image import (
+    InvalidScreenDimensionError,
+    InvalidScreenOrientationError,
+)
 from cbzfit.process import (
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
     DestinationConflictMode,
     ImageProcessingOptions,
     OutputVerificationMode,
+    SourceDestinationConflictError,
 )
 
 
@@ -624,6 +629,9 @@ class TestMain:
         "error",
         [
             InvalidArchiveError("Archive validation failed"),
+            InvalidScreenDimensionError("Screen dimensions are invalid"),
+            InvalidScreenOrientationError("Screen orientation is invalid"),
+            SourceDestinationConflictError("Archive paths conflict"),
             UnsupportedImageContentError("Image content is unsupported"),
             UnsupportedImageFormatError("Image format is unsupported"),
             FileNotFoundError("Source archive is missing"),
@@ -672,12 +680,153 @@ class TestMain:
         process_archive.assert_called_once()
         print_summary.assert_not_called()
 
-    def test_unexpected_processing_error_is_propagated(
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("--screen-width", "0"),
+            ("--screen-height", "-1"),
+        ],
+    )
+    def test_non_positive_cli_dimension_is_rejected_before_processing(
+        self,
+        option: str,
+        value: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        process_archive = Mock()
+        print_summary = Mock()
+        arguments = required_arguments()
+        arguments[arguments.index(option) + 1] = value
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_archive,
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["cbzfit", *arguments],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 2
+        assert captured.out == ""
+        assert (
+            f"expected a positive integer, got {value!r}"
+            in captured.err
+        )
+        assert "Traceback" not in captured.err
+        process_archive.assert_not_called()
+        print_summary.assert_not_called()
+
+    def test_landscape_screen_orientation_is_reported_before_processing(
         self,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        error = RuntimeError("Unexpected processing failure")
+        process_archive = Mock()
+        print_summary = Mock()
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_archive,
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                "missing-source.cbz",
+                "destination.cbz",
+                "--screen-width",
+                "1872",
+                "--screen-height",
+                "1404",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == (
+            "cbzfit: error: Screen size must be provided in "
+            "portrait orientation.\n"
+        )
+        assert "Traceback" not in captured.err
+        process_archive.assert_not_called()
+        print_summary.assert_not_called()
+
+    def test_equivalent_paths_are_reported_without_summary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        archive_path = tmp_path / "source.cbz"
+        archive_path.write_bytes(b"source")
+        print_summary = Mock()
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(archive_path),
+                str(tmp_path / "." / "source.cbz"),
+                "--screen-width",
+                "1404",
+                "--screen-height",
+                "1872",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == (
+            "cbzfit: error: Source and destination archive paths must "
+            "be different unless destination replacement is enabled.\n"
+        )
+        assert "Traceback" not in captured.err
+        print_summary.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ValueError("Unexpected validation failure"),
+            RuntimeError("Unexpected processing failure"),
+        ],
+    )
+    def test_unexpected_processing_error_is_propagated(
+        self,
+        error: Exception,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
         process_archive = Mock(side_effect=error)
         print_summary = Mock()
         monkeypatch.setattr(
@@ -699,10 +848,11 @@ class TestMain:
             ],
         )
 
-        with pytest.raises(RuntimeError) as exception_info:
+        with pytest.raises(type(error)) as exception_info:
             main()
 
         captured = capsys.readouterr()
+
         assert exception_info.value is error
         assert captured.out == ""
         assert captured.err == ""

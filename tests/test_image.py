@@ -18,6 +18,7 @@ from cbzfit.image import (
     get_embedded_icc_profile,
     prepare_image_for_format,
     resize_for_display,
+    validate_portrait_screen_size,
 )
 
 
@@ -34,6 +35,56 @@ class TestInvalidScreenDimensionError:
 class TestInvalidScreenOrientationError:
     def test_error_is_a_value_error(self) -> None:
         assert issubclass(InvalidScreenOrientationError, ValueError)
+
+class TestValidatePortraitScreenSize:
+
+    @pytest.mark.parametrize(
+        "screen_size",
+        [
+            (1404, 1872),
+            (1404, 1404),
+        ],
+    )
+    def test_valid_size_is_returned(
+        self,
+        screen_size: tuple[int, int],
+    ) -> None:
+        assert validate_portrait_screen_size(screen_size) == screen_size
+
+    @pytest.mark.parametrize(
+        "screen_size",
+        [
+            (0, 1404),
+            (1404, 0),
+            (-1, 1404),
+            (1404, -1),
+        ],
+    )
+    def test_non_positive_dimension_is_rejected(
+        self,
+        screen_size: tuple[int, int],
+    ) -> None:
+        expected_message = (
+            "Screen dimensions must be positive integers."
+        )
+
+        with pytest.raises(
+            InvalidScreenDimensionError,
+            match=exact_message(expected_message),
+        ):
+            validate_portrait_screen_size(screen_size)
+
+    def test_landscape_orientation_is_rejected(self) -> None:
+        expected_message = (
+            "Screen size must be provided in portrait orientation."
+        )
+
+        with pytest.raises(
+            InvalidScreenOrientationError,
+            match=exact_message(expected_message),
+        ):
+            validate_portrait_screen_size((1872, 1404))
+
 
 class TestFitSizeWithin:
 

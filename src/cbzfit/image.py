@@ -19,6 +19,25 @@ class InvalidScreenOrientationError(ValueError):
     """Raised when screen dimensions are not in portrait orientation."""
 
 
+def validate_portrait_screen_size(
+    screen_size: tuple[int, int],
+) -> tuple[int, int]:
+    """Validate and return screen dimensions in portrait orientation."""
+    screen_width, screen_height = screen_size
+
+    if screen_width <= 0 or screen_height <= 0:
+        raise InvalidScreenDimensionError(
+            "Screen dimensions must be positive integers."
+        )
+
+    if screen_width > screen_height:
+        raise InvalidScreenOrientationError(
+            "Screen size must be provided in portrait orientation."
+        )
+
+    return screen_size
+
+
 @dataclass(frozen=True)
 class PreparedImage:
     """Contain a format-compatible image and optional ICC profile."""
@@ -76,17 +95,9 @@ def calculate_display_fit(
     target size, but it does not rotate the image itself.
     """
     image_width, image_height = original_size
-    screen_width, screen_height = portrait_screen_size
-
-    if screen_width <= 0 or screen_height <= 0:
-        raise InvalidScreenDimensionError(
-            "Screen dimensions must be positive integers."
-        )
-
-    if screen_width > screen_height:
-        raise InvalidScreenOrientationError(
-            "Screen size must be provided in portrait orientation."
-        )
+    screen_width, screen_height = validate_portrait_screen_size(
+        portrait_screen_size
+    )
 
     image_is_landscape = image_width > image_height
 
