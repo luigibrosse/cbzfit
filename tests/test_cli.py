@@ -1,3 +1,4 @@
+
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
@@ -56,6 +57,74 @@ def required_arguments() -> list[str]:
         "--screen-height",
         "1872",
     ]
+
+
+def create_valid_cli_source_archive(archive_path: Path) -> None:
+    """Create a minimal valid CBZ archive for CLI integration tests."""
+    image = Image.new(
+        mode="RGB",
+        size=(10, 20),
+        color="white",
+    )
+    image_stream = BytesIO()
+    try:
+        image.save(image_stream, format="PNG")
+    finally:
+        image.close()
+
+    with ZipFile(archive_path, mode="w") as archive:
+        archive.writestr("001.png", image_stream.getvalue())
+
+
+def prepare_cli_error_case(
+    case: str,
+    tmp_path: Path,
+) -> tuple[list[str], str]:
+    """Prepare one real CLI failure and return its arguments and message."""
+    source_path = tmp_path / "source.cbz"
+    destination_path = tmp_path / "destination.cbz"
+
+    if case == "missing-source":
+        expected_message = (
+            f"Source archive file does not exist: {source_path}."
+        )
+    elif case == "invalid-zip":
+        source_path.write_bytes(b"not a ZIP archive")
+        expected_message = (
+            f"File is not a valid ZIP archive: {source_path}."
+        )
+    elif case == "existing-destination":
+        create_valid_cli_source_archive(source_path)
+        destination_path.write_bytes(b"existing destination")
+        expected_message = (
+            f"Destination archive already exists: {destination_path}."
+        )
+    elif case == "invalid-destination-parent":
+        create_valid_cli_source_archive(source_path)
+        destination_path = tmp_path / "missing" / "destination.cbz"
+        expected_message = (
+            "Destination directory does not exist: "
+            f"{destination_path.parent}."
+        )
+    elif case == "unsupported-image":
+        with ZipFile(source_path, mode="w") as archive:
+            archive.writestr("001.jpg", b"not an image")
+        expected_message = (
+            "Image data could not be decoded: '001.jpg'."
+        )
+    else:
+        raise AssertionError(f"Unsupported CLI error test case: {case!r}.")
+
+    arguments = [
+        str(source_path),
+        str(destination_path),
+        "--screen-width",
+        "1404",
+        "--screen-height",
+        "1872",
+    ]
+
+    return arguments, expected_message
 
 
 class TestPositiveInteger:
@@ -527,7 +596,6 @@ class TestPrintProcessingSummary:
             f"Output: {destination}\n"
         )
 
-
 class TestMain:
     @pytest.mark.parametrize(
         (
@@ -773,47 +841,6 @@ class TestMain:
         process_archive.assert_not_called()
         print_summary.assert_not_called()
 
-    def test_equivalent_paths_are_reported_without_summary(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        archive_path = tmp_path / "source.cbz"
-        archive_path.write_bytes(b"source")
-        print_summary = Mock()
-        monkeypatch.setattr(
-            cli_module,
-            "print_processing_summary",
-            print_summary,
-        )
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "cbzfit",
-                str(archive_path),
-                str(tmp_path / "." / "source.cbz"),
-                "--screen-width",
-                "1404",
-                "--screen-height",
-                "1872",
-            ],
-        )
-
-        with pytest.raises(SystemExit) as exception_info:
-            main()
-
-        captured = capsys.readouterr()
-        assert exception_info.value.code == 1
-        assert captured.out == ""
-        assert captured.err == (
-            "cbzfit: error: Source and destination archive paths must "
-            "be different unless destination replacement is enabled.\n"
-        )
-        assert "Traceback" not in captured.err
-        print_summary.assert_not_called()
-
     @pytest.mark.parametrize(
         "error",
         [
@@ -859,6 +886,86 @@ class TestMain:
         process_archive.assert_called_once()
         print_summary.assert_not_called()
 
+class TestCliErrorHandlingIntegration:
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "missing-source",
+            "invalid-zip",
+            "existing-destination",
+            "invalid-destination-parent",
+            "unsupported-image",
+        ],
+    )
+    def test_expected_application_error_is_handled_without_traceback(
+        self,
+        case: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        arguments, expected_message = prepare_cli_error_case(
+            case,
+            tmp_path,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["cbzfit", *arguments],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == f"cbzfit: error: {expected_message}\n"
+        assert "Traceback" not in captured.err
+        assert list(tmp_path.rglob(".*.tmp")) == []
+
+    def test_equivalent_paths_are_reported_without_summary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        archive_path = tmp_path / "source.cbz"
+        archive_path.write_bytes(b"source")
+        print_summary = Mock()
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            print_summary,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(archive_path),
+                str(tmp_path / "." / "source.cbz"),
+                "--screen-width",
+                "1404",
+                "--screen-height",
+                "1872",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == (
+            "cbzfit: error: Source and destination archive paths must "
+            "be different unless destination replacement is enabled.\n"
+        )
+        assert "Traceback" not in captured.err
+        print_summary.assert_not_called()
+
+class TestCliProcessingIntegration:
     def test_archive_is_processed_end_to_end(
         self,
         tmp_path: Path,
