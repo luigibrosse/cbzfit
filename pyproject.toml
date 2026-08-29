@@ -5,10 +5,23 @@ build-backend = "hatchling.build"
 [project]
 name = "cbzfit"
 version = "0.1.0"
-description = "Resize and optimize manga CBZ archives for e-readers and other displays."
+description = "Resize manga and comic CBZ archives for e-readers and other displays."
+keywords = ["cbz", "manga", "comics", "image-resizing", "e-reader"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
 readme = "README.md"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [
     { name = "luigibrosse" }
 ]
@@ -25,6 +38,11 @@ dev = [
 
 [project.scripts]
 cbzfit = "cbzfit.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/luigibrosse/cbzfit"
+Repository = "https://github.com/luigibrosse/cbzfit"
+Issues = "https://github.com/luigibrosse/cbzfit/issues"
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
