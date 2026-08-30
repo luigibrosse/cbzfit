@@ -1,3 +1,5 @@
+
+
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import os
@@ -7,6 +9,7 @@ from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import perf_counter
 from zipfile import (
     ZIP_DEFLATED,
     ZIP_STORED,
@@ -113,6 +116,16 @@ class ArchiveTransformationResult:
     copied_other_members: int
     input_uncompressed_size: int
     output_uncompressed_size: int
+
+
+@dataclass(frozen=True)
+class ArchiveProcessingResult:
+    """Summarize a successfully processed archive file."""
+
+    transformation_result: ArchiveTransformationResult
+    source_file_size: int
+    destination_file_size: int
+    elapsed_seconds: float
 
 
 class OutputVerificationMode(StrEnum):
@@ -412,20 +425,27 @@ def process_archive_file(
     conflict_mode: DestinationConflictMode = (
         DestinationConflictMode.ERROR
     ),
-) -> ArchiveTransformationResult:
-    """Atomically transform, verify, and publish one archive file.
+) -> ArchiveProcessingResult:
+    """Transform, verify, and atomically publish one archive file.
 
-    The source archive is transformed into a temporary file created beside the
-    destination. After transformation succeeds and both archives are closed,
-    the temporary archive is verified using the selected verification mode.
+    The source file size is captured before processing starts. Archive contents
+    are written to a temporary file beside the destination, and both ZIP files
+    are closed before the temporary archive is verified and published.
 
-    ERROR publishes the result only when the destination does not exist.
-    REPLACE atomically replaces an existing destination and permits source and
-    destination to refer to the same file.
+    ERROR publishes only when the destination does not exist. REPLACE atomically
+    replaces an existing destination and permits in-place processing when the
+    source and destination paths identify the same file.
 
-    The temporary file is removed when transformation, verification, or
-    publication fails.
+    After successful publication, the destination file size is read from the
+    published path. Elapsed time uses a monotonic performance timer and covers
+    validation, transformation, verification, publication, and final size
+    measurement. The temporary file is removed if transformation, verification,
+    or publication fails.
+
+    Return file-level metrics together with the archive-content transformation
+    result.
     """
+    started_at = perf_counter()
     _validate_output_verification_mode(verification_mode)
     _validate_destination_conflict_mode(conflict_mode)
 
@@ -439,6 +459,7 @@ def process_archive_file(
             f"Source archive path is not a file: {source_path}."
         )
 
+    source_file_size = source_path.stat().st_size
     destination_parent = destination_path.parent
 
     if not destination_parent.exists():
@@ -520,4 +541,12 @@ def process_archive_file(
             temporary_path.unlink(missing_ok=True)
         raise
 
-    return result
+    destination_file_size = destination_path.stat().st_size
+    finished_at = perf_counter()
+
+    return ArchiveProcessingResult(
+        transformation_result=result,
+        source_file_size=source_file_size,
+        destination_file_size=destination_file_size,
+        elapsed_seconds=finished_at - started_at,
+    )

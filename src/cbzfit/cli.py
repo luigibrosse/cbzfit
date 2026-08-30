@@ -1,3 +1,4 @@
+
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
@@ -198,7 +199,7 @@ def main() -> int:
 
     print_processing_summary(
         arguments.destination,
-        result,
+        result.transformation_result,
     )
 
     return 0

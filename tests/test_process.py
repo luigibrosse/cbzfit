@@ -1,3 +1,5 @@
+
+
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
@@ -34,6 +36,7 @@ from cbzfit.image import (
     InvalidScreenOrientationError,
 )
 from cbzfit.process import (
+    ArchiveProcessingResult,
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
     DestinationConflictMode,
@@ -991,6 +994,30 @@ class TestArchiveTransformationResult:
         assert result.copied_other_members == 1
         assert result.input_uncompressed_size == 1_000
         assert result.output_uncompressed_size == 600
+
+
+class TestArchiveProcessingResult:
+    def test_result_fields_are_retained(self) -> None:
+        transformation_result = ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=1,
+            unchanged_images=0,
+            copied_other_members=0,
+            input_uncompressed_size=200,
+            output_uncompressed_size=100,
+        )
+        result = ArchiveProcessingResult(
+            transformation_result=transformation_result,
+            source_file_size=250,
+            destination_file_size=150,
+            elapsed_seconds=1.25,
+        )
+
+        assert result.transformation_result is transformation_result
+        assert result.source_file_size == 250
+        assert result.destination_file_size == 150
+        assert result.elapsed_seconds == 1.25
 
 
 class TestOutputVerificationMode:
@@ -2020,7 +2047,7 @@ class TestProcessArchiveFile:
             with open_encoded_image(transformed_image) as image:
                 assert image.size == (10, 20)
 
-        assert result == ArchiveTransformationResult(
+        assert result.transformation_result == ArchiveTransformationResult(
             total_file_members=3,
             image_members=2,
             transformed_images=1,
@@ -2037,7 +2064,7 @@ class TestProcessArchiveFile:
                 + len(unchanged_image)
             ),
         )
-    def test_transformation_result_is_returned(
+    def test_archives_are_closed_before_publication(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -2046,14 +2073,9 @@ class TestProcessArchiveFile:
         destination_path = tmp_path / "output.cbz"
         create_archive_file(
             source_path,
-            [("001.png", create_encoded_image("PNG"))],
+            [("001.png", create_encoded_image("PNG"))]
         )
-        options = ArchiveTransformationOptions(
-            image_options=ImageProcessingOptions(
-                portrait_screen_size=(10, 20),
-            ),
-        )
-        expected_result = ArchiveTransformationResult(
+        transformation_result = ArchiveTransformationResult(
             total_file_members=1,
             image_members=1,
             transformed_images=0,
@@ -2062,7 +2084,7 @@ class TestProcessArchiveFile:
             input_uncompressed_size=100,
             output_uncompressed_size=100,
         )
-        transform = Mock(return_value=expected_result)
+        transform = Mock(return_value=transformation_result)
         real_publish = process_module._publish_archive
 
         def publish_after_archives_are_closed(
@@ -2094,18 +2116,164 @@ class TestProcessArchiveFile:
             "_publish_archive",
             publish,
         )
-
         result = process_archive_file(
             source_path,
             destination_path,
-            options=options,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
         )
-
-        assert result is expected_result
-        transform.assert_called_once()
-        assert transform.call_args.kwargs == {"options": options}
+        assert result.transformation_result is transformation_result
         publish.assert_called_once()
-        assert destination_path.is_file()
+
+    def test_success_returns_actual_file_sizes_and_elapsed_time(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG", size=(20, 40)))],
+        )
+        source_file_size = source_path.stat().st_size
+        timer = Mock(side_effect=[10.0, 10.75])
+        monkeypatch.setattr(
+            process_module,
+            "perf_counter",
+            timer,
+        )
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+        assert result.source_file_size == source_file_size
+        assert result.destination_file_size == destination_path.stat().st_size
+        assert result.elapsed_seconds == 0.75
+        assert timer.call_count == 2
+
+    def test_destination_size_is_measured_after_publication(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        published_suffix = b"published-size-marker"
+        real_publish = process_module._publish_archive
+
+        def publish_and_extend_destination(
+            temporary_path: Path,
+            published_path: Path,
+            *,
+            conflict_mode: DestinationConflictMode,
+        ) -> None:
+            real_publish(temporary_path,
+                published_path,
+                conflict_mode=conflict_mode
+            )
+            with published_path.open("ab") as destination:
+                destination.write(published_suffix)
+
+        monkeypatch.setattr(
+            process_module,
+            "_publish_archive",
+            publish_and_extend_destination,
+        )
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+        assert destination_path.read_bytes().endswith(published_suffix)
+        assert result.destination_file_size == destination_path.stat().st_size
+
+    def test_elapsed_time_covers_processing_through_final_size_measurement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        events: list[str] = []
+        real_transform = process_module.transform_archive_contents
+        real_publish = process_module._publish_archive
+
+        def timer() -> float:
+            if not events:
+                events.append("timer-start")
+                return 20.0
+            assert destination_path.is_file()
+            events.append("timer-finish")
+            return 21.5
+
+        def track_transform(
+            *args: object,
+            **kwargs: object
+        ) -> ArchiveTransformationResult:
+            events.append("transform")
+            return real_transform(*args, **kwargs)  # type: ignore[arg-type]
+
+        def track_publish(
+            temporary_path: Path,
+            published_path: Path,
+            *,
+            conflict_mode: DestinationConflictMode,
+        ) -> None:
+            events.append("publish")
+            real_publish(
+                temporary_path,
+                published_path,
+                conflict_mode=conflict_mode,
+            )
+
+        monkeypatch.setattr(
+            process_module,
+            "perf_counter",
+            timer,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            track_transform,
+        )
+        monkeypatch.setattr(
+            process_module,
+            "_publish_archive",
+            track_publish,
+        )
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+        assert events == ["timer-start", "transform", "publish", "timer-finish"]
+        assert result.elapsed_seconds == 1.5
+
     @pytest.mark.parametrize(
         "verification_mode",
         list(OutputVerificationMode),
@@ -2137,7 +2305,7 @@ class TestProcessArchiveFile:
             verification_mode=verification_mode,
         )
 
-        assert result == ArchiveTransformationResult(
+        assert result.transformation_result == ArchiveTransformationResult(
             total_file_members=1,
             image_members=1,
             transformed_images=0,
@@ -2239,7 +2407,7 @@ class TestProcessArchiveFile:
             verification_mode=verification_mode,
         )
 
-        assert result is expected_result
+        assert result.transformation_result is expected_result
         assert events == ["verify", "publish"]
         verify.assert_called_once()
         publish.assert_called_once()
@@ -2625,11 +2793,15 @@ class TestProcessArchiveFile:
     def test_in_place_processing_succeeds_when_replacement_is_enabled(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         archive_path = tmp_path / "source.cbz"
         large_image = create_encoded_image("PNG", size=(20, 40))
         create_archive_file(archive_path, [("001.png", large_image)])
         original_data = archive_path.read_bytes()
+        original_file_size = archive_path.stat().st_size
+        timer = Mock(side_effect=[30.0, 30.5])
+        monkeypatch.setattr(process_module, "perf_counter", timer)
 
         result = process_archive_file(
             archive_path,
@@ -2643,7 +2815,11 @@ class TestProcessArchiveFile:
         )
 
         assert archive_path.read_bytes() != original_data
-        assert result.transformed_images == 1
+        assert result.transformation_result.transformed_images == 1
+        assert result.source_file_size == original_file_size
+        assert result.destination_file_size == archive_path.stat().st_size
+        assert result.elapsed_seconds == 0.5
+        assert result.source_file_size != result.destination_file_size
         with (
             ZipFile(archive_path, mode="r") as archive,
             open_encoded_image(archive.read("001.png")) as image,

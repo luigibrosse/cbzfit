@@ -1,4 +1,5 @@
 
+
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
@@ -33,6 +34,7 @@ from cbzfit.image import (
     InvalidScreenOrientationError,
 )
 from cbzfit.process import (
+    ArchiveProcessingResult,
     ArchiveTransformationOptions,
     ArchiveTransformationResult,
     DestinationConflictMode,
@@ -642,7 +644,7 @@ class TestMain:
     ) -> None:
         source_path = Path("source.cbz")
         destination_path = Path("destination.cbz")
-        processing_result = ArchiveTransformationResult(
+        transformation_result = ArchiveTransformationResult(
             total_file_members=3,
             image_members=2,
             transformed_images=1,
@@ -650,6 +652,12 @@ class TestMain:
             copied_other_members=1,
             input_uncompressed_size=1_000,
             output_uncompressed_size=600,
+        )
+        processing_result = ArchiveProcessingResult(
+            transformation_result=transformation_result,
+            source_file_size=1_200,
+            destination_file_size=800,
+            elapsed_seconds=0.5,
         )
         process_archive = Mock(return_value=processing_result)
         print_summary = Mock()
@@ -690,7 +698,7 @@ class TestMain:
         }
         print_summary.assert_called_once_with(
             destination_path,
-            processing_result,
+            transformation_result,
         )
 
     @pytest.mark.parametrize(
