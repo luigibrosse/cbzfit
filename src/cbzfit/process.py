@@ -1,5 +1,3 @@
-
-
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import os
@@ -21,6 +19,7 @@ from PIL import Image, UnidentifiedImageError
 
 from cbzfit.archive import (
     DEFAULT_MAX_ARCHIVE_FILES,
+    DEFAULT_MEMBER_READ_CHUNK_SIZE,
     ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
@@ -28,7 +27,6 @@ from cbzfit.archive import (
     MemberDateTimePolicy,
     build_manifest,
     read_member_data,
-    verify_archive_integrity,
     write_member_data,
 )
 from cbzfit.decode import (
@@ -42,6 +40,12 @@ from cbzfit.encode import (
 from cbzfit.image import (
     resize_for_display,
     validate_portrait_screen_size,
+)
+from cbzfit.progress import (
+    ArchiveProgress,
+    ArchiveProgressPhase,
+    ProgressCallback,
+    report_progress,
 )
 
 
@@ -219,6 +223,7 @@ def transform_archive_contents(
     destination_archive: ZipFile,
     *,
     options: ArchiveTransformationOptions,
+    progress_callback: ProgressCallback | None = None,
 ) -> ArchiveTransformationResult:
     """Transform contents between two open ZIP archives.
 
@@ -228,6 +233,8 @@ def transform_archive_contents(
 
     Members are processed and written in their original archive order. The
     source and destination archives remain open and are owned by the caller.
+    Progress reports completed members, allowing a future coordinator to emit
+    the same monotonic events when member processing becomes parallel.
     """
     manifest = build_manifest(
         source_archive,
@@ -241,6 +248,15 @@ def transform_archive_contents(
         path_limits=options.path_limits,
     )
 
+    total_file_members = len(manifest.file_members)
+    report_progress(
+        progress_callback,
+        ArchiveProgress(
+            phase=ArchiveProgressPhase.TRANSFORMING,
+            completed=0,
+            total=total_file_members,
+        ),
+    )
     read_state = ArchiveReadState()
     image_filenames = {
         member.filename
@@ -252,7 +268,10 @@ def transform_archive_contents(
     copied_other_members = 0
     output_uncompressed_size = 0
 
-    for member in manifest.file_members:
+    for completed_members, member in enumerate(
+        manifest.file_members,
+        start=1,
+    ):
         member_data = read_member_data(
             source_archive,
             member,
@@ -299,8 +318,17 @@ def transform_archive_contents(
 
         output_uncompressed_size += len(output_data)
 
+        report_progress(
+            progress_callback,
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=completed_members,
+                total=total_file_members,
+                member_name=member.filename,
+            ),
+        )
     return ArchiveTransformationResult(
-        total_file_members=len(manifest.file_members),
+        total_file_members=total_file_members,
         image_members=manifest.image_count,
         transformed_images=transformed_images,
         unchanged_images=unchanged_images,
@@ -326,25 +354,64 @@ def _verify_output_archive(
     archive_path: Path,
     *,
     mode: OutputVerificationMode,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
-    """Verify a finalized output archive.
+    """Verify a finalized output archive and report verification progress.
 
-
-    NONE trusts successful ZIP finalization.
-    STRUCTURE reopens and parses the ZIP central directory.
-    CRC additionally reads every member and verifies its CRC.
+    NONE trusts successful ZIP finalization and emits no progress.
+    STRUCTURE emits one indeterminate event before parsing the central directory.
+    CRC emits an initial 0/N event and one event after each member is read fully,
+    which validates its local header, compressed data, and CRC.
     """
     _validate_output_verification_mode(mode)
-
     if mode is OutputVerificationMode.NONE:
         return
-
     try:
         with ZipFile(archive_path, mode="r") as archive:
             if mode is OutputVerificationMode.STRUCTURE:
+                report_progress(
+                    progress_callback,
+                    ArchiveProgress(
+                        phase=ArchiveProgressPhase.VERIFYING,
+                    ),
+                )
                 archive.infolist()
             elif mode is OutputVerificationMode.CRC:
-                verify_archive_integrity(archive)
+                members = tuple(
+                    member
+                    for member in archive.infolist()
+                    if not member.is_dir()
+                )
+                total_members = len(members)
+                report_progress(
+                    progress_callback,
+                    ArchiveProgress(
+                        phase=ArchiveProgressPhase.VERIFYING,
+                        completed=0,
+                        total=total_members,
+                    ),
+                )
+                for completed_members, member in enumerate(members, start=1):
+                    try:
+                        with archive.open(member, mode="r") as member_stream:
+                            while member_stream.read(
+                                DEFAULT_MEMBER_READ_CHUNK_SIZE
+                            ):
+                                pass
+                    except BadZipFile as error:
+                        raise InvalidArchiveError(
+                            "Archive member failed its integrity check: "
+                            f"{member.filename!r}."
+                        ) from error
+                    report_progress(
+                        progress_callback,
+                        ArchiveProgress(
+                            phase=ArchiveProgressPhase.VERIFYING,
+                            completed=completed_members,
+                            total=total_members,
+                            member_name=member.filename,
+                        ),
+                    )
             else:  # pragma: no cover - guards future enum members
                 raise ValueError(
                     f"Unsupported output verification mode: {mode!r}."
@@ -425,6 +492,7 @@ def process_archive_file(
     conflict_mode: DestinationConflictMode = (
         DestinationConflictMode.ERROR
     ),
+    progress_callback: ProgressCallback | None = None,
 ) -> ArchiveProcessingResult:
     """Transform, verify, and atomically publish one archive file.
 
@@ -442,6 +510,9 @@ def process_archive_file(
     measurement. The temporary file is removed if transformation, verification,
     or publication fails.
 
+    Progress is emitted as interface-neutral events. Callbacks run in the
+    coordinating caller's execution context and should return quickly; worker
+    threads or processes must not invoke user-interface code directly.
     Return file-level metrics together with the archive-content transformation
     result.
     """
@@ -520,6 +591,7 @@ def process_archive_file(
                     source_archive,
                     destination_archive,
                     options=options,
+                    progress_callback=progress_callback,
                 )
         except BadZipFile as error:
             raise InvalidArchiveError(
@@ -529,8 +601,13 @@ def process_archive_file(
         _verify_output_archive(
             temporary_path,
             mode=verification_mode,
+            progress_callback=progress_callback,
         )
 
+        report_progress(
+            progress_callback,
+            ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING),
+        )
         _publish_archive(
             temporary_path,
             destination_path,

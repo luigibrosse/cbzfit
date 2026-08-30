@@ -474,17 +474,6 @@ def write_member_data(
     return output_member
 
 
-def verify_archive_integrity(archive: ZipFile) -> None:
-    """Verify the CRC and file header of every archive member."""
-    corrupt_member = archive.testzip()
-
-    if corrupt_member is not None:
-        raise InvalidArchiveError(
-            f"Archive member failed its integrity check: "
-            f"{corrupt_member!r}."
-        )
-
-
 def build_manifest(
     archive: ZipFile,
     *,

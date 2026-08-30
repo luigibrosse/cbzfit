@@ -1,5 +1,3 @@
-
-
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
@@ -47,6 +45,10 @@ from cbzfit.process import (
     process_archive_file,
     process_image_data,
     transform_archive_contents,
+)
+from cbzfit.progress import (
+    ArchiveProgress,
+    ArchiveProgressPhase,
 )
 
 
@@ -1020,6 +1022,262 @@ class TestArchiveProcessingResult:
         assert result.elapsed_seconds == 1.25
 
 
+class TestArchiveProgressReporting:
+    def test_transformation_reports_initial_and_completed_members_in_order(
+        self,
+    ) -> None:
+        source_stream = BytesIO()
+        image_data = create_encoded_image("PNG")
+        with ZipFile(source_stream, mode="w") as source:
+            source.writestr("001.png", image_data)
+            source.writestr("ComicInfo.xml", b"<ComicInfo />")
+            source.writestr("002.png", image_data)
+        source_stream.seek(0)
+        destination_stream = BytesIO()
+        progress_events: list[ArchiveProgress] = []
+
+        with (
+            ZipFile(source_stream, mode="r") as source,
+            ZipFile(destination_stream, mode="w") as destination,
+        ):
+            transform_archive_contents(
+                source,
+                destination,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                progress_callback=progress_events.append,
+            )
+
+        assert progress_events == [
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
+                total=3,
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=1,
+                total=3,
+                member_name="001.png",
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=2,
+                total=3,
+                member_name="ComicInfo.xml",
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=3,
+                total=3,
+                member_name="002.png",
+            ),
+        ]
+
+    def test_failed_member_is_not_reported_as_completed(self) -> None:
+        source_stream = BytesIO()
+        with ZipFile(source_stream, mode="w") as source:
+            source.writestr("001.png", create_encoded_image("PNG"))
+            source.writestr("002.png", b"not-an-image")
+        source_stream.seek(0)
+        destination_stream = BytesIO()
+        progress_events: list[ArchiveProgress] = []
+
+        with (
+            ZipFile(source_stream, mode="r") as source,
+            ZipFile(destination_stream, mode="w") as destination,
+            pytest.raises(UnsupportedImageContentError),
+        ):
+            transform_archive_contents(
+                source,
+                destination,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                progress_callback=progress_events.append,
+            )
+
+        assert progress_events == [
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
+                total=2,
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=1,
+                total=2,
+                member_name="001.png",
+            ),
+        ]
+
+    def test_file_processing_reports_phase_order_and_forwards_callback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        callback = Mock()
+        transformation_result = ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=0,
+            unchanged_images=1,
+            copied_other_members=0,
+            input_uncompressed_size=100,
+            output_uncompressed_size=100,
+        )
+
+        def transform_with_progress(
+            source_archive: ZipFile,
+            destination_archive: ZipFile,
+            *,
+            options: ArchiveTransformationOptions,
+            progress_callback: object,
+        ) -> ArchiveTransformationResult:
+            assert progress_callback is callback
+            destination_archive.writestr("001.png", b"output")
+            callback(
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=0,
+                    total=1,
+                )
+            )
+            callback(
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=1,
+                    total=1,
+                    member_name="001.png",
+                )
+            )
+            return transformation_result
+
+        monkeypatch.setattr(
+            process_module,
+            "transform_archive_contents",
+            transform_with_progress,
+        )
+
+        result = process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+            progress_callback=callback,
+        )
+
+        assert result.transformation_result is transformation_result
+        assert [call.args[0] for call in callback.call_args_list] == [
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
+                total=1,
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=1,
+                total=1,
+                member_name="001.png",
+            ),
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
+            ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING),
+        ]
+
+    def test_verification_failure_does_not_report_publication(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        events: list[ArchiveProgress] = []
+        error = InvalidArchiveError("Verification failed")
+        def fail_verification(
+            archive_path: Path,
+            *,
+            mode: OutputVerificationMode,
+            progress_callback: object,
+        ) -> None:
+            progress_callback(
+                ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+            )
+            raise error
+
+        monkeypatch.setattr(
+            process_module,
+            "_verify_output_archive",
+            fail_verification,
+        )
+
+        with pytest.raises(InvalidArchiveError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                progress_callback=events.append,
+            )
+
+        assert exception_info.value is error
+        assert events[-1] == ArchiveProgress(
+            phase=ArchiveProgressPhase.VERIFYING
+        )
+        assert ArchiveProgress(
+            phase=ArchiveProgressPhase.PUBLISHING
+        ) not in events
+
+    def test_callback_failure_stops_processing_and_cleans_temporary_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        error = RuntimeError("Progress consumer failed")
+        callback = Mock(side_effect=error)
+
+        with pytest.raises(RuntimeError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                progress_callback=callback,
+            )
+
+        assert exception_info.value is error
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
+
+
 class TestOutputVerificationMode:
     def test_supported_modes_have_expected_values(self) -> None:
         assert OutputVerificationMode.NONE == "none"
@@ -1235,12 +1493,16 @@ class TestVerifyOutputArchive:
             open_archive,
         )
 
+        progress_callback = Mock()
+
         process_module._verify_output_archive(
             archive_path,
             mode=OutputVerificationMode.NONE,
+            progress_callback=progress_callback,
         )
 
         open_archive.assert_not_called()
+        progress_callback.assert_not_called()
 
     def test_structure_mode_reopens_and_parses_archive(
         self,
@@ -1258,45 +1520,116 @@ class TestVerifyOutputArchive:
             open_archive,
         )
 
+        events: list[ArchiveProgress] = []
+
         process_module._verify_output_archive(
             archive_path,
             mode=OutputVerificationMode.STRUCTURE,
+            progress_callback=events.append,
         )
 
         open_archive.assert_called_once_with(archive_path, mode="r")
         archive.infolist.assert_called_once_with()
+        assert events == [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+        ]
         archive_context.__exit__.assert_called_once()
 
-    def test_crc_mode_delegates_integrity_check(
+    def test_crc_mode_excludes_directory_entries_from_progress(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        with ZipFile(archive_path, mode="w") as archive:
+            archive.writestr("Chapter 01/", b"")
+            archive.writestr("Chapter 01/001.png", b"image data")
+        events: list[ArchiveProgress] = []
+
+        process_module._verify_output_archive(
+            archive_path,
+            mode=OutputVerificationMode.CRC,
+            progress_callback=events.append,
+        )
+
+        assert events == [
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=0,
+                total=1,
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=1,
+                total=1,
+                member_name="Chapter 01/001.png",
+            ),
+        ]
+
+    def test_crc_mode_reads_members_and_reports_progress(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         archive_path = tmp_path / "output.cbz"
+        first_member = MagicMock()
+        first_member.filename = "001.png"
+        first_member.is_dir.return_value = False
+        second_member = MagicMock()
+        second_member.filename = "ComicInfo.xml"
+        second_member.is_dir.return_value = False
+        first_stream = MagicMock()
+        first_stream.__enter__.return_value = first_stream
+        first_stream.read.side_effect = [b"first", b""]
+        second_stream = MagicMock()
+        second_stream.__enter__.return_value = second_stream
+        second_stream.read.side_effect = [b"second", b""]
         archive = MagicMock(spec=ZipFile)
+        archive.infolist.return_value = [first_member, second_member]
+        archive.open.side_effect = [first_stream, second_stream]
         archive_context = MagicMock()
         archive_context.__enter__.return_value = archive
-        open_archive = Mock(return_value=archive_context)
-        verify_integrity = Mock()
+        callback = Mock()
         monkeypatch.setattr(
             process_module,
             "ZipFile",
-            open_archive,
-        )
-        monkeypatch.setattr(
-            process_module,
-            "verify_archive_integrity",
-            verify_integrity,
+            Mock(return_value=archive_context),
         )
 
         process_module._verify_output_archive(
             archive_path,
             mode=OutputVerificationMode.CRC,
+            progress_callback=callback,
         )
 
-        open_archive.assert_called_once_with(archive_path, mode="r")
-        verify_integrity.assert_called_once_with(archive)
-        archive.infolist.assert_not_called()
+        archive.testzip.assert_not_called()
+        assert archive.open.call_args_list == [
+            ((first_member,), {"mode": "r"}),
+            ((second_member,), {"mode": "r"}),
+        ]
+        expected_size = process_module.DEFAULT_MEMBER_READ_CHUNK_SIZE
+        assert first_stream.read.call_args_list == [
+            ((expected_size,),),
+            ((expected_size,),),
+        ]
+        assert [call.args[0] for call in callback.call_args_list] == [
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=0,
+                total=2,
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=1,
+                total=2,
+                member_name="001.png",
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=2,
+                total=2,
+                member_name="ComicInfo.xml",
+            ),
+        ]
         archive_context.__exit__.assert_called_once()
 
     def test_invalid_mode_is_rejected_before_archive_is_opened(
@@ -1354,36 +1687,52 @@ class TestVerifyOutputArchive:
 
         assert exception_info.value.__cause__ is error
 
-    def test_crc_integrity_failure_is_propagated(
+    def test_crc_integrity_failure_reports_no_completion_for_failed_member(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         archive_path = tmp_path / "output.cbz"
+        member = MagicMock()
+        member.filename = "002.jpg"
+        member.is_dir.return_value = False
+        member_stream = MagicMock()
+        member_stream.__enter__.return_value = member_stream
+        error = BadZipFile("Bad CRC-32 for file '002.jpg'")
+        member_stream.read.side_effect = error
         archive = MagicMock(spec=ZipFile)
+        archive.infolist.return_value = [member]
+        archive.open.return_value = member_stream
         archive_context = MagicMock()
         archive_context.__enter__.return_value = archive
-        error = InvalidArchiveError(
-            "Archive member failed its integrity check: '002.jpg'."
-        )
         monkeypatch.setattr(
             process_module,
             "ZipFile",
             Mock(return_value=archive_context),
         )
-        monkeypatch.setattr(
-            process_module,
-            "verify_archive_integrity",
-            Mock(side_effect=error),
+        events: list[ArchiveProgress] = []
+        expected_message = (
+            "Archive member failed its integrity check: '002.jpg'."
         )
 
-        with pytest.raises(InvalidArchiveError) as exception_info:
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ) as exception_info:
             process_module._verify_output_archive(
                 archive_path,
                 mode=OutputVerificationMode.CRC,
+                progress_callback=events.append,
             )
 
-        assert exception_info.value is error
+        assert exception_info.value.__cause__ is error
+        assert events == [
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=0,
+                total=1,
+            )
+        ]
         archive_context.__exit__.assert_called_once()
 
 
@@ -2361,7 +2710,9 @@ class TestProcessArchiveFile:
             archive_path: Path,
             *,
             mode: OutputVerificationMode,
+            progress_callback: object,
         ) -> None:
+            assert progress_callback is None
             source_archive, destination_archive = transform.call_args.args
             assert source_archive.fp is None
             assert destination_archive.fp is None
@@ -2443,6 +2794,7 @@ class TestProcessArchiveFile:
         verify.assert_called_once()
         assert verify.call_args.kwargs == {
             "mode": OutputVerificationMode.STRUCTURE,
+            "progress_callback": None,
         }
 
     def test_invalid_verification_mode_is_rejected_before_file_processing(
@@ -2523,6 +2875,7 @@ class TestProcessArchiveFile:
         verify.assert_called_once()
         assert verify.call_args.kwargs == {
             "mode": OutputVerificationMode.CRC,
+            "progress_callback": None,
         }
         publish.assert_not_called()
         assert not destination_path.exists()

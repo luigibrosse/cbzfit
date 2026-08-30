@@ -35,7 +35,6 @@ from cbzfit.archive import (
     resolve_member_date_time,
     validate_member_path,
     validate_zip_date_time,
-    verify_archive_integrity,
     write_member_data,
 )
 
@@ -1599,30 +1598,6 @@ class TestWriteMemberData:
             b"image data",
         )
 
-
-class TestVerifyArchiveIntegrity:
-
-    def test_integrity_check_accepts_valid_archive(self) -> None:
-        archive_stream = create_archive(
-            [("001.jpg", b"image")]
-        )
-
-        with ZipFile(archive_stream, mode="r") as archive:
-            verify_archive_integrity(archive)
-
-
-    def test_integrity_check_rejects_corrupt_member(self) -> None:
-        archive = Mock(spec=ZipFile)
-        archive.testzip.return_value = "002.jpg"
-        expected_message = (
-            "Archive member failed its integrity check: '002.jpg'."
-        )
-
-        with pytest.raises(
-            InvalidArchiveError,
-            match=exact_message(expected_message),
-        ):
-            verify_archive_integrity(archive)
 
 class TestInspectCbz:
 
