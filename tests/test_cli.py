@@ -1,5 +1,3 @@
-
-
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
@@ -19,8 +17,13 @@ from cbzfit.archive import (
     InvalidArchiveError,
 )
 from cbzfit.cli import (
+    MEBIBYTE,
     build_parser,
+    calculate_size_change_percentage,
     format_count,
+    format_elapsed_time,
+    format_file_size,
+    format_size_change,
     main,
     positive_integer,
     print_processing_summary,
@@ -507,63 +510,218 @@ class TestFormatCount:
             format_count("Image", count)
 
 
+class TestFileSizeFormatting:
+    @pytest.mark.parametrize(
+        ("size_bytes", "expected"),
+        [
+            (0, "0.0 MiB"),
+            (MEBIBYTE, "1.0 MiB"),
+            (180 * MEBIBYTE, "180.0 MiB"),
+            (int(95.8 * MEBIBYTE), "95.8 MiB"),
+        ],
+    )
+    def test_byte_count_is_formatted_as_mebibytes(
+        self,
+        size_bytes: int,
+        expected: str,
+    ) -> None:
+        assert format_file_size(size_bytes) == expected
+
+    def test_negative_file_size_is_rejected(self) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message("File size must not be negative."),
+        ):
+            format_file_size(-1)
+
+
+class TestSizeChangeFormatting:
+    @pytest.mark.parametrize(
+        ("source_size", "destination_size", "expected"),
+        [
+            (180 * MEBIBYTE, int(95.8 * MEBIBYTE), 46.8),
+            (int(95.8 * MEBIBYTE), int(100.2 * MEBIBYTE), 4.6),
+            (MEBIBYTE, MEBIBYTE, 0.0),
+            (0, MEBIBYTE, None),
+        ],
+    )
+    def test_percentage_change_is_calculated(
+        self,
+        source_size: int,
+        destination_size: int,
+        expected: float | None,
+    ) -> None:
+        result = calculate_size_change_percentage(
+            source_size,
+            destination_size,
+        )
+        if expected is None:
+            assert result is None
+        else:
+            assert result == pytest.approx(expected, abs=0.05)
+
+    @pytest.mark.parametrize(
+        ("source_size", "destination_size"),
+        [(-1, 0), (0, -1)],
+    )
+    def test_negative_size_is_rejected(
+        self,
+        source_size: int,
+        destination_size: int,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message("File sizes must not be negative."),
+        ):
+            calculate_size_change_percentage(source_size, destination_size)
+
+    @pytest.mark.parametrize(
+        ("source_size", "destination_size", "expected"),
+        [
+            (180 * MEBIBYTE, int(95.8 * MEBIBYTE), "46.8 % decrease"),
+            (int(95.8 * MEBIBYTE), int(100.2 * MEBIBYTE), "4.6 % increase"),
+            (int(95.8 * MEBIBYTE), int(95.8 * MEBIBYTE), "no change"),
+            (0, 1, "percentage unavailable"),
+            (0, 0, "no change"),
+        ],
+    )
+    def test_size_change_is_described(
+        self,
+        source_size: int,
+        destination_size: int,
+        expected: str,
+    ) -> None:
+        assert format_size_change(source_size, destination_size) == expected
+
+
+class TestElapsedTimeFormatting:
+    @pytest.mark.parametrize(
+        ("elapsed_seconds", "expected"),
+        [
+            (10.54, "10.5 s"),
+            (0.0, "0.0 s"),
+            (-0.25, "0.0 s"),
+        ],
+    )
+    def test_elapsed_time_is_formatted_and_clamped(
+        self,
+        elapsed_seconds: float,
+        expected: str,
+    ) -> None:
+        assert format_elapsed_time(elapsed_seconds) == expected
+
+    @pytest.mark.parametrize(
+        ("elapsed_seconds", "expected"),
+        [
+            (10.44, "10.4 s"),
+            (10.46, "10.5 s"),
+        ],
+    )
+    def test_elapsed_time_is_rounded_to_one_decimal_place(
+        self,
+        elapsed_seconds: float,
+        expected: str,
+    ) -> None:
+        assert format_elapsed_time(elapsed_seconds) == expected
+
+
 class TestPrintProcessingSummary:
     @pytest.mark.parametrize(
         ("result", "expected_summary"),
         [
             (
-                ArchiveTransformationResult(
-                    total_file_members=300,
-                    image_members=200,
-                    transformed_images=100,
-                    unchanged_images=100,
-                    copied_other_members=100,
-                    input_uncompressed_size=1_000,
-                    output_uncompressed_size=600,
+                ArchiveProcessingResult(
+                    transformation_result=ArchiveTransformationResult(
+                        total_file_members=300,
+                        image_members=200,
+                        transformed_images=100,
+                        unchanged_images=100,
+                        copied_other_members=100,
+                        input_uncompressed_size=1_000,
+                        output_uncompressed_size=600,
+                    ),
+                    source_file_size=180 * MEBIBYTE,
+                    destination_file_size=int(95.8 * MEBIBYTE),
+                    elapsed_seconds=10.54,
                 ),
                 (
-                    "Output: optimized.cbz\n"
+                    "Output: optimized.cbz completed in 10.5 s\n"
                     "└─Images: 200 total, 100 transformed, "
                     "100 unchanged. Other members copied: 100\n"
+                    "└─Size: 180.0 MiB -> 95.8 MiB, 46.8 % decrease\n"
                 ),
             ),
             (
-                ArchiveTransformationResult(
-                    total_file_members=2,
-                    image_members=1,
-                    transformed_images=1,
-                    unchanged_images=0,
-                    copied_other_members=1,
-                    input_uncompressed_size=100,
-                    output_uncompressed_size=80,
+                ArchiveProcessingResult(
+                    transformation_result=ArchiveTransformationResult(
+                        total_file_members=2,
+                        image_members=1,
+                        transformed_images=1,
+                        unchanged_images=0,
+                        copied_other_members=1,
+                        input_uncompressed_size=100,
+                        output_uncompressed_size=80,
+                    ),
+                    source_file_size=int(95.8 * MEBIBYTE),
+                    destination_file_size=int(100.2 * MEBIBYTE),
+                    elapsed_seconds=-1.0,
                 ),
                 (
-                    "Output: optimized.cbz\n"
+                    "Output: optimized.cbz completed in 0.0 s\n"
                     "└─Image: 1 total, 1 transformed, "
                     "0 unchanged. Other member copied: 1\n"
+                    "└─Size: 95.8 MiB -> 100.2 MiB, 4.6 % increase\n"
                 ),
             ),
             (
-                ArchiveTransformationResult(
-                    total_file_members=0,
-                    image_members=0,
-                    transformed_images=0,
-                    unchanged_images=0,
-                    copied_other_members=0,
-                    input_uncompressed_size=0,
-                    output_uncompressed_size=0,
+                ArchiveProcessingResult(
+                    transformation_result=ArchiveTransformationResult(
+                        total_file_members=2,
+                        image_members=2,
+                        transformed_images=0,
+                        unchanged_images=2,
+                        copied_other_members=0,
+                        input_uncompressed_size=100,
+                        output_uncompressed_size=100,
+                    ),
+                    source_file_size=int(95.8 * MEBIBYTE),
+                    destination_file_size=int(95.8 * MEBIBYTE),
+                    elapsed_seconds=1.0,
                 ),
                 (
-                    "Output: optimized.cbz\n"
-                    "└─Images: 0 total, 0 transformed, "
-                    "0 unchanged. Other members copied: 0\n"
+                    "Output: optimized.cbz completed in 1.0 s\n"
+                    "└─Images: 2 total, 0 transformed, "
+                    "2 unchanged. Other members copied: 0\n"
+                    "└─Size: 95.8 MiB -> 95.8 MiB, no change\n"
+                ),
+            ),
+            (
+                ArchiveProcessingResult(
+                    transformation_result=ArchiveTransformationResult(
+                        total_file_members=1,
+                        image_members=1,
+                        transformed_images=0,
+                        unchanged_images=1,
+                        copied_other_members=0,
+                        input_uncompressed_size=0,
+                        output_uncompressed_size=1,
+                    ),
+                    source_file_size=0,
+                    destination_file_size=MEBIBYTE,
+                    elapsed_seconds=0.04,
+                ),
+                (
+                    "Output: optimized.cbz completed in 0.0 s\n"
+                    "└─Image: 1 total, 0 transformed, "
+                    "1 unchanged. Other members copied: 0\n"
+                    "└─Size: 0.0 MiB -> 1.0 MiB, percentage unavailable\n"
                 ),
             ),
         ],
     )
-    def test_exact_two_line_summary_is_printed(
+    def test_exact_three_line_summary_is_printed(
         self,
-        result: ArchiveTransformationResult,
+        result: ArchiveProcessingResult,
         expected_summary: str,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -571,9 +729,7 @@ class TestPrintProcessingSummary:
             Path("optimized.cbz"),
             result,
         )
-
         captured = capsys.readouterr()
-
         assert captured.out == expected_summary
         assert captured.err == ""
 
@@ -582,21 +738,27 @@ class TestPrintProcessingSummary:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         destination = Path("Output") / "Manga Volume 01.cbz"
-        result = ArchiveTransformationResult(
-            total_file_members=1,
-            image_members=1,
-            transformed_images=0,
-            unchanged_images=1,
-            copied_other_members=0,
-            input_uncompressed_size=100,
-            output_uncompressed_size=100,
+        result = ArchiveProcessingResult(
+            transformation_result=ArchiveTransformationResult(
+                total_file_members=1,
+                image_members=1,
+                transformed_images=0,
+                unchanged_images=1,
+                copied_other_members=0,
+                input_uncompressed_size=100,
+                output_uncompressed_size=100,
+            ),
+            source_file_size=MEBIBYTE,
+            destination_file_size=MEBIBYTE,
+            elapsed_seconds=0.5,
         )
 
         print_processing_summary(destination, result)
 
         assert capsys.readouterr().out.startswith(
-            f"Output: {destination}\n"
+            f"Output: {destination} completed in 0.5 s\n"
         )
+
 
 class TestMain:
     @pytest.mark.parametrize(
@@ -698,7 +860,7 @@ class TestMain:
         }
         print_summary.assert_called_once_with(
             destination_path,
-            transformation_result,
+            processing_result,
         )
 
     @pytest.mark.parametrize(
@@ -1019,10 +1181,22 @@ class TestCliProcessingIntegration:
 
         captured = capsys.readouterr()
         assert result == 0
-        assert captured.out == (
-            f"Output: {destination_path}\n"
+        summary_lines = captured.out.splitlines()
+        assert len(summary_lines) == 3
+        assert re.fullmatch(
+            rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
+            summary_lines[0],
+        )
+        assert summary_lines[1] == (
             "└─Image: 1 total, 1 transformed, 0 unchanged. "
-            "Other member copied: 1\n"
+            "Other member copied: 1"
+        )
+        source_size = len(source_archive_data)
+        destination_size = destination_path.stat().st_size
+        assert summary_lines[2] == (
+            f"└─Size: {format_file_size(source_size)} -> "
+            f"{format_file_size(destination_size)}, "
+            f"{format_size_change(source_size, destination_size)}"
         )
         assert captured.err == ""
         assert source_path.read_bytes() == source_archive_data

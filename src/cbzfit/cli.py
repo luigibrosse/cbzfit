@@ -1,4 +1,3 @@
-
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
@@ -17,14 +16,16 @@ from cbzfit.image import (
     InvalidScreenOrientationError,
 )
 from cbzfit.process import (
+    ArchiveProcessingResult,
     ArchiveTransformationOptions,
-    ArchiveTransformationResult,
     DestinationConflictMode,
     ImageProcessingOptions,
     OutputVerificationMode,
     SourceDestinationConflictError,
     process_archive_file,
 )
+
+MEBIBYTE = 1024**2
 
 
 def positive_integer(value: str) -> int:
@@ -50,7 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cbzfit",
         description="Resize manga CBZ archives to fit a target display.",
     )
-
     parser.add_argument(
         "source",
         type=Path,
@@ -134,21 +134,69 @@ def format_count(
     """Return a singular or plural noun based on a non-negative count."""
     if count < 0:
         raise ValueError("Count must not be negative.")
-        
+
     return singular if count == 1 else f"{singular}s"
+
+
+def format_file_size(size_bytes: int) -> str:
+    """Format a non-negative byte count as MiB with one decimal place."""
+    if size_bytes < 0:
+        raise ValueError("File size must not be negative.")
+
+    return f"{size_bytes / MEBIBYTE:.1f} MiB"
+
+
+def calculate_size_change_percentage(
+    source_size: int,
+    destination_size: int,
+) -> float | None:
+    """Return the absolute percentage size change, or None for a zero source."""
+    if source_size < 0 or destination_size < 0:
+        raise ValueError("File sizes must not be negative.")
+    if source_size == 0:
+        return None
+
+    return abs(destination_size - source_size) / source_size * 100
+
+
+def format_size_change(
+    source_size: int,
+    destination_size: int,
+) -> str:
+    """Describe the direction and percentage of an archive-size change."""
+    percentage = calculate_size_change_percentage(
+        source_size,
+        destination_size,
+    )
+    if source_size == destination_size:
+        return "no change"
+    if percentage is None:
+        return "percentage unavailable"
+    direction = "decrease" if destination_size < source_size else "increase"
+
+    return f"{percentage:.1f} % {direction}"
+
+
+def format_elapsed_time(elapsed_seconds: float) -> str:
+    """Format elapsed seconds with one decimal place, clamped to zero."""
+    return f"{max(elapsed_seconds, 0.0):.1f} s"
 
 
 def print_processing_summary(
     destination: Path,
-    result: ArchiveTransformationResult,
+    result: ArchiveProcessingResult,
 ) -> None:
-    """Print a concise archive-processing summary."""
-    image_members = result.image_members
-    transformed_images = result.transformed_images
-    unchanged_images = result.unchanged_images
-    copied_other_members = result.copied_other_members
+    """Print archive-content, elapsed-time, and actual file-size metrics."""
+    transformation = result.transformation_result
+    image_members = transformation.image_members
+    transformed_images = transformation.transformed_images
+    unchanged_images = transformation.unchanged_images
+    copied_other_members = transformation.copied_other_members
 
-    print(f"Output: {destination}")
+    print(
+        f"Output: {destination} completed in "
+        f"{format_elapsed_time(result.elapsed_seconds)}"
+    )
     print(
         f"└─{format_count('Image', image_members)}: "
         f"{image_members} total, "
@@ -157,13 +205,17 @@ def print_processing_summary(
         f"{format_count('Other member', copied_other_members)} copied: "
         f"{copied_other_members}"
     )
+    print(
+        f"└─Size: {format_file_size(result.source_file_size)} -> "
+        f"{format_file_size(result.destination_file_size)}, "
+        f"{format_size_change(result.source_file_size, result.destination_file_size)}"
+    )
 
 
 def main() -> int:
     """Run the CBZFit command-line interface."""
     parser = build_parser()
     arguments = parser.parse_args()
-
     try:
         image_options = ImageProcessingOptions(
             portrait_screen_size=(
@@ -199,7 +251,7 @@ def main() -> int:
 
     print_processing_summary(
         arguments.destination,
-        result.transformation_result,
+        result,
     )
 
     return 0
