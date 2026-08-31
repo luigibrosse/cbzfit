@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
+import sys
 from pathlib import Path
 
 from cbzfit import __version__
@@ -24,6 +25,7 @@ from cbzfit.process import (
     SourceDestinationConflictError,
     process_archive_file,
 )
+from cbzfit.progress import TerminalProgressRenderer
 
 MEBIBYTE = 1024**2
 
@@ -105,6 +107,11 @@ def build_parser() -> argparse.ArgumentParser:
             "output verification mode: none, structure, or crc "
             "(default: structure)"
         ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable interactive progress display",
     )
     parser.add_argument(
         "--conflict",
@@ -216,6 +223,21 @@ def main() -> int:
     """Run the CBZFit command-line interface."""
     parser = build_parser()
     arguments = parser.parse_args()
+    progress_renderer = (
+        TerminalProgressRenderer(sys.stderr)
+        if not arguments.no_progress and sys.stderr.isatty()
+        else None
+    )
+    progress_callback = (
+        progress_renderer.report
+        if progress_renderer is not None
+        else None
+    )
+
+    def clear_progress() -> None:
+        if progress_renderer is not None:
+            progress_renderer.clear()
+
     try:
         image_options = ImageProcessingOptions(
             portrait_screen_size=(
@@ -234,6 +256,7 @@ def main() -> int:
             options=transformation_options,
             verification_mode=arguments.verification_mode,
             conflict_mode=arguments.conflict_mode,
+            progress_callback=progress_callback,
         )
     except (
         InvalidArchiveError,
@@ -244,14 +267,18 @@ def main() -> int:
         UnsupportedImageFormatError,
         OSError,
     ) as error:
+        clear_progress()
         parser.exit(
             status=1,
             message=f"{parser.prog}: error: {error}\n",
         )
+    except BaseException:
+        clear_progress()
+        raise
 
+    clear_progress()
     print_processing_summary(
         arguments.destination,
         result,
     )
-
     return 0

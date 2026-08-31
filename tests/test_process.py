@@ -1513,14 +1513,22 @@ class TestVerifyOutputArchive:
         archive = MagicMock(spec=ZipFile)
         archive_context = MagicMock()
         archive_context.__enter__.return_value = archive
-        open_archive = Mock(return_value=archive_context)
+        events: list[ArchiveProgress] = []
+
+        def open_archive(path: Path, *, mode: str) -> MagicMock:
+            assert events == [
+                ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+            ]
+            assert path == archive_path
+            assert mode == "r"
+            return archive_context
+
+        open_archive_mock = Mock(side_effect=open_archive)
         monkeypatch.setattr(
             process_module,
             "ZipFile",
-            open_archive,
+            open_archive_mock,
         )
-
-        events: list[ArchiveProgress] = []
 
         process_module._verify_output_archive(
             archive_path,
@@ -1528,12 +1536,76 @@ class TestVerifyOutputArchive:
             progress_callback=events.append,
         )
 
-        open_archive.assert_called_once_with(archive_path, mode="r")
+        open_archive_mock.assert_called_once_with(archive_path, mode="r")
         archive.infolist.assert_called_once_with()
         assert events == [
             ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
         ]
         archive_context.__exit__.assert_called_once()
+
+    def test_crc_mode_reports_verification_before_opening_archive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "output.cbz"
+        member = MagicMock()
+        member.filename = "001.png"
+        member.is_dir.return_value = False
+        member_stream = MagicMock()
+        member_stream.__enter__.return_value = member_stream
+        member_stream.read.return_value = b""
+        archive = MagicMock(spec=ZipFile)
+        archive.infolist.return_value = [member]
+        archive.open.return_value = member_stream
+        archive_context = MagicMock()
+        archive_context.__enter__.return_value = archive
+        call_order: list[str] = []
+        events: list[ArchiveProgress] = []
+
+        def report(progress: ArchiveProgress) -> None:
+            call_order.append("progress callback")
+            events.append(progress)
+
+        def open_archive(path: Path, *, mode: str) -> MagicMock:
+            call_order.append("ZipFile construction")
+            assert events == [
+                ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+            ]
+            assert path == archive_path
+            assert mode == "r"
+            return archive_context
+
+        monkeypatch.setattr(
+            process_module,
+            "ZipFile",
+            Mock(side_effect=open_archive),
+        )
+
+        process_module._verify_output_archive(
+            archive_path,
+            mode=OutputVerificationMode.CRC,
+            progress_callback=report,
+        )
+
+        assert call_order[:2] == [
+            "progress callback",
+            "ZipFile construction",
+        ]
+        assert events == [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=0,
+                total=1,
+            ),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=1,
+                total=1,
+                member_name="001.png",
+            ),
+        ]
 
     def test_crc_mode_excludes_directory_entries_from_progress(
         self,
@@ -1552,6 +1624,7 @@ class TestVerifyOutputArchive:
         )
 
         assert events == [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
             ArchiveProgress(
                 phase=ArchiveProgressPhase.VERIFYING,
                 completed=0,
@@ -1612,6 +1685,7 @@ class TestVerifyOutputArchive:
             ((expected_size,),),
         ]
         assert [call.args[0] for call in callback.call_args_list] == [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
             ArchiveProgress(
                 phase=ArchiveProgressPhase.VERIFYING,
                 completed=0,
@@ -1660,10 +1734,18 @@ class TestVerifyOutputArchive:
 
         open_archive.assert_not_called()
 
-    def test_invalid_zip_is_wrapped(
+    @pytest.mark.parametrize(
+        "verification_mode",
+        [
+            OutputVerificationMode.STRUCTURE,
+            OutputVerificationMode.CRC,
+        ],
+    )
+    def test_invalid_zip_is_wrapped_after_indeterminate_progress(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        verification_mode: OutputVerificationMode,
     ) -> None:
         archive_path = tmp_path / "output.cbz"
         error = BadZipFile("Invalid central directory")
@@ -1675,6 +1757,7 @@ class TestVerifyOutputArchive:
         expected_message = (
             "The transformed output is not a valid ZIP archive."
         )
+        events: list[ArchiveProgress] = []
 
         with pytest.raises(
             InvalidArchiveError,
@@ -1682,15 +1765,29 @@ class TestVerifyOutputArchive:
         ) as exception_info:
             process_module._verify_output_archive(
                 archive_path,
-                mode=OutputVerificationMode.STRUCTURE,
+                mode=verification_mode,
+                progress_callback=events.append,
             )
 
         assert exception_info.value.__cause__ is error
+        assert events == [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+        ]
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BadZipFile("Bad CRC-32 for file '002.jpg'"),
+            EOFError("Unexpected end of data"),
+            OSError("Decompression failure"),
+            RuntimeError("Archive read failure"),
+        ],
+    )
     def test_crc_integrity_failure_reports_no_completion_for_failed_member(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        error: Exception,
     ) -> None:
         archive_path = tmp_path / "output.cbz"
         member = MagicMock()
@@ -1698,7 +1795,6 @@ class TestVerifyOutputArchive:
         member.is_dir.return_value = False
         member_stream = MagicMock()
         member_stream.__enter__.return_value = member_stream
-        error = BadZipFile("Bad CRC-32 for file '002.jpg'")
         member_stream.read.side_effect = error
         archive = MagicMock(spec=ZipFile)
         archive.infolist.return_value = [member]
@@ -1727,11 +1823,12 @@ class TestVerifyOutputArchive:
 
         assert exception_info.value.__cause__ is error
         assert events == [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
             ArchiveProgress(
                 phase=ArchiveProgressPhase.VERIFYING,
                 completed=0,
                 total=1,
-            )
+            ),
         ]
         archive_context.__exit__.assert_called_once()
 

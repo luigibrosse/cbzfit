@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+
 import re
+from io import StringIO
 from unittest.mock import Mock
 
 import pytest
 
+import cbzfit.progress as progress_module
 from cbzfit.progress import (
     ArchiveProgress,
     ArchiveProgressPhase,
+    TerminalProgressRenderer,
     report_progress,
 )
 
@@ -36,8 +40,18 @@ class TestArchiveProgress:
         assert progress.total == 5
         assert progress.member_name == "Chapter 01/002.png"
 
-    def test_indeterminate_progress_fields_default_to_none(self) -> None:
-        progress = ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+    @pytest.mark.parametrize(
+        "phase",
+        [
+            ArchiveProgressPhase.VERIFYING,
+            ArchiveProgressPhase.PUBLISHING,
+        ],
+    )
+    def test_supported_indeterminate_phase_fields_default_to_none(
+        self,
+        phase: ArchiveProgressPhase,
+    ) -> None:
+        progress = ArchiveProgress(phase=phase)
         assert progress.completed is None
         assert progress.total is None
         assert progress.member_name is None
@@ -74,7 +88,7 @@ class TestArchiveProgress:
 
     @pytest.mark.parametrize(
         ("completed", "total"),
-        [(False, 1), (0, True), (0.0, 1), (0, 1.0)],
+        [(0.0, 1), (0, 1.0)],
     )
     def test_non_integer_counts_are_rejected(
         self,
@@ -91,22 +105,37 @@ class TestArchiveProgress:
                 total=total,  # type: ignore[arg-type]
             )
 
-    @pytest.mark.parametrize(
-        ("completed", "total"),
-        [(-1, 1), (0, -1)],
-    )
-    def test_negative_counts_are_rejected(
-        self,
-        completed: int,
-        total: int,
-    ) -> None:
+    def test_boolean_counts_follow_normal_integer_behavior(self) -> None:
+        progress = ArchiveProgress(
+            phase=ArchiveProgressPhase.TRANSFORMING,
+            completed=False,
+            total=True,
+        )
+        assert progress.completed is False
+        assert progress.total is True
+
+    def test_negative_completed_count_is_rejected(self) -> None:
         with pytest.raises(
             ValueError,
-            match=exact_message("Progress counts must not be negative."),
+            match=exact_message("Completed progress must not be negative."),
         ):
             ArchiveProgress(
                 phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=completed,
+                completed=-1,
+                total=1,
+            )
+
+    @pytest.mark.parametrize("total", [0, -1])
+    def test_non_positive_total_is_rejected(self, total: int) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Total progress must be a positive integer."
+            ),
+        ):
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
                 total=total,
             )
 
@@ -120,6 +149,28 @@ class TestArchiveProgress:
             ArchiveProgress(
                 phase=ArchiveProgressPhase.TRANSFORMING,
                 completed=2,
+                total=1,
+            )
+
+    def test_transformation_requires_determinate_counts(self) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Transformation progress requires member counts."
+            ),
+        ):
+            ArchiveProgress(phase=ArchiveProgressPhase.TRANSFORMING)
+
+    def test_publication_rejects_determinate_counts(self) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Publication progress must not contain member counts."
+            ),
+        ):
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.PUBLISHING,
+                completed=0,
                 total=1,
             )
 
@@ -147,12 +198,21 @@ class TestArchiveProgress:
                 member_name="",
             )
 
-    @pytest.mark.parametrize("completed", [None, 0])
+    @pytest.mark.parametrize(
+        "progress",
+        [
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
+                total=1,
+            ),
+        ],
+    )
     def test_member_name_requires_completed_work(
         self,
-        completed: int | None,
+        progress: ArchiveProgress,
     ) -> None:
-        total = None if completed is None else 1
         with pytest.raises(
             ValueError,
             match=exact_message(
@@ -160,9 +220,9 @@ class TestArchiveProgress:
             ),
         ):
             ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=completed,
-                total=total,
+                phase=progress.phase,
+                completed=progress.completed,
+                total=progress.total,
                 member_name="001.png",
             )
 
@@ -187,3 +247,176 @@ class TestReportProgress:
         with pytest.raises(RuntimeError) as exception_info:
             report_progress(callback, progress)
         assert exception_info.value is error
+
+
+class TestProgressFormatting:
+    @pytest.mark.parametrize(
+        ("progress", "expected"),
+        [
+            (
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=0,
+                    total=200,
+                ),
+                "Processing [────────────────────] 0 % (0/200)",
+            ),
+            (
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=1,
+                    total=3,
+                    member_name="001.png",
+                ),
+                "Processing [██████──────────────] 33 % (1/3)",
+            ),
+            (
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=142,
+                    total=200,
+                    member_name="142.png",
+                ),
+                "Processing [██████████████──────] 71 % (142/200)",
+            ),
+            (
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.VERIFYING,
+                    completed=80,
+                    total=200,
+                    member_name="080.png",
+                ),
+                "Verifying  [████████────────────] 40 % (80/200)",
+            ),
+            (
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=199,
+                    total=200,
+                    member_name="199.png",
+                ),
+                "Processing [███████████████████─] 99 % (199/200)",
+            ),
+            (
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=200,
+                    total=200,
+                    member_name="200.png",
+                ),
+                "Processing [████████████████████] 100 % (200/200)",
+            ),
+            (
+                ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
+                "Verifying output archive...",
+            ),
+            (
+                ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING),
+                None,
+            ),
+        ],
+    )
+    def test_progress_is_formatted(
+        self,
+        progress: ArchiveProgress,
+        expected: str | None,
+    ) -> None:
+        assert progress_module._format_progress(progress) == expected
+
+    def test_invalid_bar_width_is_rejected(self) -> None:
+        progress = ArchiveProgress(
+            phase=ArchiveProgressPhase.TRANSFORMING,
+            completed=0,
+            total=1,
+        )
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Progress bar width must be a positive integer."
+            ),
+        ):
+            progress_module._format_progress(progress, bar_width=0)
+
+
+class TestTerminalProgressRenderer:
+    def test_progress_replaces_the_active_line(self) -> None:
+        stream = StringIO()
+        renderer = TerminalProgressRenderer(stream)
+        renderer.report(
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
+                total=200,
+            )
+        )
+        renderer.report(
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.VERIFYING,
+                completed=80,
+                total=200,
+                member_name="080.png",
+            )
+        )
+        assert stream.getvalue() == (
+            "\rProcessing [────────────────────] 0 % (0/200)"
+            "\rVerifying  [████████────────────] 40 % (80/200)"
+        )
+
+    def test_shorter_status_erases_stale_characters(self) -> None:
+        stream = StringIO()
+        renderer = TerminalProgressRenderer(stream)
+        processing = "Processing [████████████████████] 100 % (200/200)"
+        status = "Verifying output archive..."
+        renderer.report(
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=200,
+                total=200,
+                member_name="200.png",
+            )
+        )
+        renderer.report(
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+        )
+        assert stream.getvalue() == (
+            "\r" + processing
+            + "\r" + status
+            + " " * (len(processing) - len(status))
+        )
+
+    def test_publication_clears_without_visible_status(self) -> None:
+        stream = StringIO()
+        renderer = TerminalProgressRenderer(stream)
+        line = "Verifying output archive..."
+        renderer.report(
+            ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+        )
+        renderer.report(
+            ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING)
+        )
+        assert stream.getvalue() == (
+            "\r" + line + "\r" + " " * len(line) + "\r"
+        )
+        assert "Publishing" not in stream.getvalue()
+
+    def test_repeated_clear_is_safe(self) -> None:
+        stream = StringIO()
+        renderer = TerminalProgressRenderer(stream)
+        renderer.clear()
+        renderer.report(
+            ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING)
+        )
+        assert stream.getvalue() == ""
+
+    def test_render_and_clear_flush_the_stream(self) -> None:
+        stream = Mock()
+        renderer = TerminalProgressRenderer(stream)
+        renderer.report(
+            ArchiveProgress(
+                phase=ArchiveProgressPhase.TRANSFORMING,
+                completed=0,
+                total=1,
+            )
+        )
+        renderer.clear()
+        assert stream.flush.call_count == 2

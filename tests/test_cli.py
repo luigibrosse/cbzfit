@@ -3,7 +3,7 @@
 import argparse
 import re
 import sys
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import Mock
 from zipfile import ZipFile
@@ -44,6 +44,10 @@ from cbzfit.process import (
     ImageProcessingOptions,
     OutputVerificationMode,
     SourceDestinationConflictError,
+)
+from cbzfit.progress import (
+    ArchiveProgress,
+    ArchiveProgressPhase,
 )
 
 
@@ -196,6 +200,7 @@ class TestBuildParser:
         assert arguments.screen_height == 1872
         assert arguments.landscape_display is True
         assert arguments.upscale is False
+        assert arguments.no_progress is False
         assert (
             arguments.verification_mode
             is OutputVerificationMode.STRUCTURE
@@ -235,11 +240,13 @@ class TestBuildParser:
                 "crc",
                 "--conflict",
                 "replace",
+                "--no-progress",
             ]
         )
 
         assert arguments.landscape_display is False
         assert arguments.upscale is True
+        assert arguments.no_progress is True
         assert arguments.verification_mode is OutputVerificationMode.CRC
         assert arguments.conflict_mode is DestinationConflictMode.REPLACE
 
@@ -436,6 +443,7 @@ class TestBuildParser:
         assert "--upscale" in output
         assert "--verify MODE" in output
         assert "--conflict MODE" in output
+        assert "--no-progress" in output
         assert "none, structure, or crc" in output
         assert "error or replace" in output
         assert "(default: enabled)" in output
@@ -857,6 +865,7 @@ class TestMain:
             ),
             "verification_mode": expected_verification_mode,
             "conflict_mode": expected_conflict_mode,
+            "progress_callback": None,
         }
         print_summary.assert_called_once_with(
             destination_path,
@@ -1215,3 +1224,392 @@ class TestCliProcessingIntegration:
                 output_image.load()
                 assert output_image.format == "PNG"
                 assert output_image.size == (10, 20)
+
+
+class CapturedErrorStream(StringIO):
+    """Capture stderr with a configurable interactive-terminal state."""
+
+    def __init__(self, *, is_tty: bool) -> None:
+        super().__init__()
+        self._is_tty = is_tty
+
+    def isatty(self) -> bool:
+        return self._is_tty
+
+
+class TestCliProgressIntegration:
+    def test_interactive_terminal_forwards_renderer_and_preserves_stdout(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        processing_result = ArchiveProcessingResult(
+            transformation_result=ArchiveTransformationResult(
+                total_file_members=1,
+                image_members=1,
+                transformed_images=0,
+                unchanged_images=1,
+                copied_other_members=0,
+                input_uncompressed_size=100,
+                output_uncompressed_size=100,
+            ),
+            source_file_size=MEBIBYTE,
+            destination_file_size=MEBIBYTE,
+            elapsed_seconds=0.5,
+        )
+        terminal = CapturedErrorStream(is_tty=True)
+
+        def process_with_progress(
+            source: Path,
+            destination: Path,
+            **kwargs: object,
+        ) -> ArchiveProcessingResult:
+            callback = kwargs["progress_callback"]
+            assert callable(callback)
+            callback(
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=0,
+                    total=1,
+                )
+            )
+            callback(
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=1,
+                    total=1,
+                    member_name="001.png",
+                )
+            )
+            callback(
+                ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
+            )
+            callback(
+                ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING)
+            )
+            return processing_result
+
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_with_progress,
+        )
+        monkeypatch.setattr(sys, "argv", ["cbzfit", *required_arguments()])
+
+        assert main() == 0
+
+        output = capsys.readouterr().out
+        assert output.startswith(
+            "Output: destination.cbz completed in 0.5 s\n"
+        )
+        progress_output = terminal.getvalue()
+        assert (
+            "Processing [────────────────────] 0 % (0/1)"
+            in progress_output
+        )
+        assert (
+            "Processing [████████████████████] 100 % (1/1)"
+            in progress_output
+        )
+        assert "Verifying output archive..." in progress_output
+        assert "Publishing" not in progress_output
+        final_line = "Verifying output archive..."
+        assert progress_output.endswith(
+            "\r" + " " * len(final_line) + "\r"
+        )
+        assert "\n" not in progress_output
+
+    def test_real_crc_progress_transitions_and_clears(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        create_valid_cli_source_archive(source_path)
+        with ZipFile(source_path, mode="a") as archive:
+            archive.writestr("ComicInfo.xml", b"<ComicInfo />")
+        terminal = CapturedErrorStream(is_tty=True)
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                str(destination_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--verify",
+                "crc",
+            ],
+        )
+
+        assert main() == 0
+
+        summary_lines = capsys.readouterr().out.splitlines()
+        assert len(summary_lines) == 3
+        assert re.fullmatch(
+            rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
+            summary_lines[0],
+        )
+        assert summary_lines[1] == (
+            "└─Image: 1 total, 0 transformed, 1 unchanged. "
+            "Other member copied: 1"
+        )
+        assert summary_lines[2].startswith("└─Size: ")
+
+        progress_output = terminal.getvalue()
+        assert "Verifying output archive..." in progress_output
+        assert "Verifying  [────────────────────] 0 % (0/2)" in progress_output
+        assert "Verifying  [██████████──────────] 50 % (1/2)" in progress_output
+        final_line = "Verifying  [████████████████████] 100 % (2/2)"
+        assert final_line in progress_output
+        assert progress_output.endswith(
+            "\r" + " " * len(final_line) + "\r"
+        )
+        assert "\n" not in progress_output
+        assert destination_path.is_file()
+
+    def test_real_none_mode_renders_only_transformation_and_clears(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        create_valid_cli_source_archive(source_path)
+        terminal = CapturedErrorStream(is_tty=True)
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                str(destination_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--verify",
+                "none",
+            ],
+        )
+
+        assert main() == 0
+
+        summary_lines = capsys.readouterr().out.splitlines()
+        assert len(summary_lines) == 3
+        assert re.fullmatch(
+            rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
+            summary_lines[0],
+        )
+        assert summary_lines[1] == (
+            "└─Image: 1 total, 0 transformed, 1 unchanged. "
+            "Other members copied: 0"
+        )
+        assert summary_lines[2].startswith("└─Size: ")
+
+        progress_output = terminal.getvalue()
+        assert "Processing [────────────────────] 0 % (0/1)" in progress_output
+        final_line = "Processing [████████████████████] 100 % (1/1)"
+        assert final_line in progress_output
+        assert "Verifying" not in progress_output
+        assert progress_output.endswith(
+            "\r" + " " * len(final_line) + "\r"
+        )
+        assert "\n" not in progress_output
+        assert destination_path.is_file()
+
+    def test_real_structure_mode_renders_status_and_clears(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        create_valid_cli_source_archive(source_path)
+        terminal = CapturedErrorStream(is_tty=True)
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                str(destination_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--verify",
+                "structure",
+            ],
+        )
+
+        assert main() == 0
+
+        summary_lines = capsys.readouterr().out.splitlines()
+        assert len(summary_lines) == 3
+        assert re.fullmatch(
+            rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
+            summary_lines[0],
+        )
+        assert summary_lines[1] == (
+            "└─Image: 1 total, 0 transformed, 1 unchanged. "
+            "Other members copied: 0"
+        )
+        assert summary_lines[2].startswith("└─Size: ")
+
+        progress_output = terminal.getvalue()
+        assert "Processing [████████████████████] 100 % (1/1)" in progress_output
+        final_line = "Verifying output archive..."
+        assert final_line in progress_output
+        assert "Verifying  [" not in progress_output
+        assert progress_output.endswith(
+            "\r" + " " * len(final_line) + "\r"
+        )
+        assert "\n" not in progress_output
+        assert destination_path.is_file()
+
+    @pytest.mark.parametrize(
+        ("is_tty", "no_progress"),
+        [
+            (False, False),
+            (True, True),
+        ],
+    )
+    def test_progress_is_suppressed_when_disabled_or_not_interactive(
+        self,
+        is_tty: bool,
+        no_progress: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        terminal = CapturedErrorStream(is_tty=is_tty)
+        additional_arguments = ["--no-progress"] if no_progress else []
+        process_archive = Mock(
+            return_value=ArchiveProcessingResult(
+                transformation_result=ArchiveTransformationResult(
+                    total_file_members=1,
+                    image_members=1,
+                    transformed_images=0,
+                    unchanged_images=1,
+                    copied_other_members=0,
+                    input_uncompressed_size=100,
+                    output_uncompressed_size=100,
+                ),
+                source_file_size=MEBIBYTE,
+                destination_file_size=MEBIBYTE,
+                elapsed_seconds=0.5,
+            )
+        )
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            process_archive,
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "print_processing_summary",
+            Mock(),
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["cbzfit", *required_arguments(), *additional_arguments],
+        )
+
+        assert main() == 0
+        assert process_archive.call_args.kwargs["progress_callback"] is None
+        assert terminal.getvalue() == ""
+
+    def test_active_progress_is_cleared_before_expected_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        terminal = CapturedErrorStream(is_tty=True)
+        error = InvalidArchiveError("Verification failed")
+
+        def fail_with_progress(
+            source: Path,
+            destination: Path,
+            **kwargs: object,
+        ) -> ArchiveProcessingResult:
+            callback = kwargs["progress_callback"]
+            assert callable(callback)
+            callback(
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.VERIFYING,
+                    completed=1,
+                    total=2,
+                    member_name="001.png",
+                )
+            )
+            raise error
+
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            fail_with_progress,
+        )
+        monkeypatch.setattr(sys, "argv", ["cbzfit", *required_arguments()])
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        assert exception_info.value.code == 1
+        output = terminal.getvalue()
+        assert (
+            "Verifying  [██████████──────────] 50 % (1/2)"
+            in output
+        )
+        assert output.endswith("\rcbzfit: error: Verification failed\n")
+
+    def test_active_progress_is_cleared_before_unexpected_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        terminal = CapturedErrorStream(is_tty=True)
+        error = RuntimeError("Unexpected failure")
+
+        def fail_with_progress(
+            source: Path,
+            destination: Path,
+            **kwargs: object,
+        ) -> ArchiveProcessingResult:
+            callback = kwargs["progress_callback"]
+            assert callable(callback)
+            callback(
+                ArchiveProgress(
+                    phase=ArchiveProgressPhase.TRANSFORMING,
+                    completed=0,
+                    total=1,
+                )
+            )
+            raise error
+
+        monkeypatch.setattr(cli_module.sys, "stderr", terminal)
+        monkeypatch.setattr(
+            cli_module,
+            "process_archive_file",
+            fail_with_progress,
+        )
+        monkeypatch.setattr(sys, "argv", ["cbzfit", *required_arguments()])
+
+        with pytest.raises(RuntimeError) as exception_info:
+            main()
+
+        assert exception_info.value is error
+        line = "Processing [────────────────────] 0 % (0/1)"
+        assert terminal.getvalue().endswith(
+            "\r" + " " * len(line) + "\r"
+        )

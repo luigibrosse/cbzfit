@@ -75,6 +75,11 @@ Use `--conflict replace` to replace an existing destination or process an archiv
 cbzfit comic.cbz comic.cbz   --screen-width 1404   --screen-height 1872   --conflict replace
 ```
 
+Progress is shown automatically on interactive terminals and is written to
+standard error, leaving the final summary on standard output. Progress is
+suppressed when output is redirected. Disable it explicitly with
+`--no-progress`.
+
 Run the built-in help for the complete command reference:
 
 ```console
@@ -93,8 +98,8 @@ Install the development dependencies and run the checks:
 
 ```console
 python -m pip install -e ".[dev]"
-pytest
-ruff check .
+python -m pytest --cov=cbzfit --cov-branch --cov-report=term-missing --cov-fail-under=100
+python -m ruff check .
 ```
 
 ## License

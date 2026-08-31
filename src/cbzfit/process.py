@@ -18,6 +18,7 @@ from zipfile import (
 from PIL import Image, UnidentifiedImageError
 
 from cbzfit.archive import (
+    ARCHIVE_MEMBER_READ_ERRORS,
     DEFAULT_MAX_ARCHIVE_FILES,
     DEFAULT_MEMBER_READ_CHUNK_SIZE,
     ArchivePathLimits,
@@ -360,21 +361,22 @@ def _verify_output_archive(
 
     NONE trusts successful ZIP finalization and emits no progress.
     STRUCTURE emits one indeterminate event before parsing the central directory.
-    CRC emits an initial 0/N event and one event after each member is read fully,
-    which validates its local header, compressed data, and CRC.
+    CRC emits the same verification-start event before opening the archive, then
+    switches to 0/N progress and reports each member after it is read fully, which
+    validates its local header, compressed data, and CRC.
     """
     _validate_output_verification_mode(mode)
     if mode is OutputVerificationMode.NONE:
         return
+
+    report_progress(
+        progress_callback,
+        ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING),
+    )
+
     try:
         with ZipFile(archive_path, mode="r") as archive:
             if mode is OutputVerificationMode.STRUCTURE:
-                report_progress(
-                    progress_callback,
-                    ArchiveProgress(
-                        phase=ArchiveProgressPhase.VERIFYING,
-                    ),
-                )
                 archive.infolist()
             elif mode is OutputVerificationMode.CRC:
                 members = tuple(
@@ -398,7 +400,7 @@ def _verify_output_archive(
                                 DEFAULT_MEMBER_READ_CHUNK_SIZE
                             ):
                                 pass
-                    except BadZipFile as error:
+                    except ARCHIVE_MEMBER_READ_ERRORS as error:
                         raise InvalidArchiveError(
                             "Archive member failed its integrity check: "
                             f"{member.filename!r}."

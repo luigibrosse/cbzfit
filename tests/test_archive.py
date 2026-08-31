@@ -201,7 +201,6 @@ class TestValidateZipDateTime:
             (2026, 1, 1, 0, 0, 0, 0),
             [2026, 1, 1, 0, 0, 0],
             (2026, 1, 1, 0, 0, "0"),
-            (2026, 1, 1, 0, 0, False),
         ],
     )
     def test_timestamp_must_contain_exactly_six_integers(
@@ -217,6 +216,10 @@ class TestValidateZipDateTime:
             match=exact_message(expected_message),
         ):
             validate_zip_date_time(date_time)  # type: ignore[arg-type]
+
+    def test_boolean_timestamp_value_follows_normal_integer_behavior(self) -> None:
+        date_time = (2026, 1, 1, 0, 0, False)
+        assert validate_zip_date_time(date_time) is date_time
 
     @pytest.mark.parametrize(
         "date_time",

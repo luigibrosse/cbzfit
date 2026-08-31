@@ -28,6 +28,7 @@ DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE = 4 * 1024**3
 DEFAULT_MAX_MEMBER_PATH_LENGTH = 1_024
 DEFAULT_MAX_PATH_COMPONENT_LENGTH = 255
 DEFAULT_MEMBER_READ_CHUNK_SIZE = 64 * 1024
+ARCHIVE_MEMBER_READ_ERRORS = (BadZipFile, EOFError, OSError, RuntimeError)
 
 ZipDateTime = tuple[int, int, int, int, int, int]
 
@@ -53,7 +54,6 @@ def validate_zip_date_time(
         or len(date_time) != 6
         or any(
             not isinstance(value, int)
-            or isinstance(value, bool)
             for value in date_time
         )
     ):
@@ -323,7 +323,7 @@ def read_member_data(
 
     except InvalidArchiveError:
         raise
-    except (BadZipFile, EOFError, OSError, RuntimeError) as error:
+    except ARCHIVE_MEMBER_READ_ERRORS as error:
         raise InvalidArchiveError(
             f"Failed to read archive member: {member.filename!r}."
         ) from error
