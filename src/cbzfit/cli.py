@@ -28,6 +28,8 @@ from cbzfit.process import (
 from cbzfit.progress import TerminalProgressRenderer
 
 MEBIBYTE = 1024**2
+AUTOMATIC_DESTINATION_EXTENSIONS = frozenset({".cbz", ".zip"})
+AUTOMATIC_DESTINATION_MARKER = " [CBZFit]"
 
 
 def positive_integer(value: str) -> int:
@@ -47,6 +49,20 @@ def positive_integer(value: str) -> int:
     return parsed_value
 
 
+def derive_destination_path(source: Path) -> Path:
+    """Derive an output path from a source with a recognized final extension."""
+    extension = source.suffix
+    if extension.lower() not in AUTOMATIC_DESTINATION_EXTENSIONS:
+        raise ValueError(
+            "When DESTINATION is omitted, SOURCE must have a .cbz "
+            "or .zip extension."
+        )
+
+    return source.with_name(
+        f"{source.name[:-len(extension)]}{AUTOMATIC_DESTINATION_MARKER}{extension}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the CBZFit command-line parser."""
     parser = argparse.ArgumentParser(
@@ -62,8 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "destination",
         type=Path,
+        nargs="?",
         metavar="DESTINATION",
-        help="destination CBZ archive",
+        help=(
+            "destination archive; when omitted, derive it from a .cbz or .zip source"
+        ),
     )
     parser.add_argument(
         "--screen-width",
@@ -223,6 +242,14 @@ def main() -> int:
     """Run the CBZFit command-line interface."""
     parser = build_parser()
     arguments = parser.parse_args()
+    if arguments.destination is None:
+        try:
+            destination = derive_destination_path(arguments.source)
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        destination = arguments.destination
+
     progress_renderer = (
         TerminalProgressRenderer(sys.stderr)
         if not arguments.no_progress and sys.stderr.isatty()
@@ -252,7 +279,7 @@ def main() -> int:
         )
         result = process_archive_file(
             arguments.source,
-            arguments.destination,
+            destination,
             options=transformation_options,
             verification_mode=arguments.verification_mode,
             conflict_mode=arguments.conflict_mode,
@@ -278,7 +305,7 @@ def main() -> int:
 
     clear_progress()
     print_processing_summary(
-        arguments.destination,
+        destination,
         result,
     )
     return 0

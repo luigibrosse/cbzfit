@@ -20,6 +20,7 @@ from cbzfit.cli import (
     MEBIBYTE,
     build_parser,
     calculate_size_change_percentage,
+    derive_destination_path,
     format_count,
     format_elapsed_time,
     format_file_size,
@@ -179,6 +180,52 @@ class TestPositiveInteger:
             positive_integer(value)
 
 
+class TestDeriveDestinationPath:
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("book.cbz", "book [CBZFit].cbz"),
+            ("Manga Volume 01.CBZ", "Manga Volume 01 [CBZFit].CBZ"),
+            ("series.v2.zip", "series.v2 [CBZFit].zip"),
+            ("book.ZIP", "book [CBZFit].ZIP"),
+            ("book.cBz", "book [CBZFit].cBz"),
+            ("book.zIp", "book [CBZFit].zIp"),
+            ("進撃の巨人 第01巻.cbz", "進撃の巨人 第01巻 [CBZFit].cbz"),
+            ("archive.tar.zip", "archive.tar [CBZFit].zip"),
+            ("directory.with.dots/book.cbz", "directory.with.dots/book [CBZFit].cbz"),
+        ],
+    )
+    def test_recognized_final_extension_is_replaced(
+        self,
+        source: str,
+        expected: str,
+    ) -> None:
+        assert derive_destination_path(Path(source)) == Path(expected)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "book",
+            "book.jpg",
+            "archive.tar.gz",
+            "book.cbz.bak",
+            ".cbz",  # Hidden file with no extension
+            ".zip",  # Hidden file with no extension
+        ],
+    )
+    def test_missing_or_unsupported_final_extension_is_rejected(
+        self,
+        source: str,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "When DESTINATION is omitted, SOURCE must have a .cbz or .zip extension."
+            ),
+        ):
+            derive_destination_path(Path(source))
+
+
 class TestBuildParser:
 
     def test_parser_metadata(self) -> None:
@@ -206,6 +253,22 @@ class TestBuildParser:
             is OutputVerificationMode.STRUCTURE
         )
         assert arguments.conflict_mode is DestinationConflictMode.ERROR
+
+    def test_destination_is_optional(self) -> None:
+        parser = build_parser()
+
+        arguments = parser.parse_args(
+            [
+                "source.cbz",
+                "--screen-width",
+                "1404",
+                "--screen-height",
+                "1872",
+            ]
+        )
+
+        assert arguments.source == Path("source.cbz")
+        assert arguments.destination is None
 
     def test_paths_with_spaces_and_unicode_are_parsed(self) -> None:
         parser = build_parser()
@@ -434,8 +497,8 @@ class TestBuildParser:
         assert exception_info.value.code == 0
         output = capsys.readouterr().out
         assert "usage: cbzfit" in output
-        assert "SOURCE" in output
-        assert "DESTINATION" in output
+        assert "usage: cbzfit [-h]" in output
+        assert "SOURCE [DESTINATION]" in output
         assert "--screen-width PIXELS" in output
         assert "--screen-height PIXELS" in output
         assert "--landscape-display" in output
@@ -872,6 +935,139 @@ class TestMain:
             processing_result,
         )
 
+    def test_omitted_destination_is_derived_before_processing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        processing_result = ArchiveProcessingResult(
+            transformation_result=ArchiveTransformationResult(
+                total_file_members=1,
+                image_members=1,
+                transformed_images=0,
+                unchanged_images=1,
+                copied_other_members=0,
+                input_uncompressed_size=100,
+                output_uncompressed_size=100,
+            ),
+            source_file_size=MEBIBYTE,
+            destination_file_size=MEBIBYTE,
+            elapsed_seconds=0.5,
+        )
+        process_archive = Mock(return_value=processing_result)
+        print_summary = Mock()
+        monkeypatch.setattr(cli_module, "process_archive_file", process_archive)
+        monkeypatch.setattr(cli_module, "print_processing_summary", print_summary)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                "library/Manga Volume 01.CBZ",
+                "--screen-width",
+                "1404",
+                "--screen-height",
+                "1872",
+            ],
+        )
+
+        assert main() == 0
+
+        destination = Path("library/Manga Volume 01 [CBZFit].CBZ")
+        assert process_archive.call_args.args == (
+            Path("library/Manga Volume 01.CBZ"),
+            destination,
+        )
+        print_summary.assert_called_once_with(destination, processing_result)
+
+    @pytest.mark.parametrize(
+        "source",
+        ["source", "source.jpg", "archive.tar.gz", "source.cbz.bak"],
+    )
+    def test_invalid_automatic_destination_is_rejected_before_processing(
+        self,
+        source: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        process_archive = Mock()
+        monkeypatch.setattr(cli_module, "process_archive_file", process_archive)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                source,
+                "--screen-width",
+                "1404",
+                "--screen-height",
+                "1872",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 2
+        assert captured.out == ""
+        assert captured.err.endswith(
+            "cbzfit: error: When DESTINATION is omitted, SOURCE must have "
+            "a .cbz or .zip extension.\n"
+        )
+        process_archive.assert_not_called()
+
+    @pytest.mark.parametrize("source", ["source", "source.jpg", "archive.tar.gz"])
+    def test_explicit_destination_allows_any_source_extension_without_derivation(
+        self,
+        source: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        processing_result = ArchiveProcessingResult(
+            transformation_result=ArchiveTransformationResult(
+                total_file_members=1,
+                image_members=1,
+                transformed_images=0,
+                unchanged_images=1,
+                copied_other_members=0,
+                input_uncompressed_size=100,
+                output_uncompressed_size=100,
+            ),
+            source_file_size=100,
+            destination_file_size=100,
+            elapsed_seconds=0.1,
+        )
+        process_archive = Mock(return_value=processing_result)
+        derive_destination = Mock(
+            side_effect=AssertionError("destination derivation must not be called")
+        )
+        monkeypatch.setattr(cli_module, "process_archive_file", process_archive)
+        monkeypatch.setattr(cli_module, "print_processing_summary", Mock())
+        monkeypatch.setattr(
+            cli_module,
+            "derive_destination_path",
+            derive_destination,
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                source,
+                "chosen-output.cbz",
+                "--screen-width",
+                "1404",
+                "--screen-height",
+                "1872",
+            ],
+        )
+
+        assert main() == 0
+        assert process_archive.call_args.args == (
+            Path(source),
+            Path("chosen-output.cbz"),
+        )
+        derive_destination.assert_not_called()
+
     @pytest.mark.parametrize(
         "error",
         [
@@ -1224,6 +1420,258 @@ class TestCliProcessingIntegration:
                 output_image.load()
                 assert output_image.format == "PNG"
                 assert output_image.size == (10, 20)
+
+
+class TestOptionalDestinationIntegration:
+    def test_explicit_destination_processes_valid_archive_with_unusual_extension(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "source.data"
+        destination_path = tmp_path / "destination.cbz"
+        create_valid_cli_source_archive(source_path)
+        source_data = source_path.read_bytes()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                str(destination_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+            ],
+        )
+
+        assert main() == 0
+
+        captured = capsys.readouterr()
+        assert captured.out.startswith(
+            f"Output: {destination_path} completed in "
+        )
+        assert captured.err == ""
+        assert source_path.read_bytes() == source_data
+        assert destination_path.is_file()
+        with ZipFile(destination_path, mode="r") as archive:
+            assert archive.testzip() is None
+            assert archive.namelist() == ["001.png"]
+
+    @pytest.mark.parametrize(
+        "source_name",
+        ["source", "source.data", "archive.tar.gz"],
+    )
+    def test_invalid_automatic_naming_has_no_filesystem_side_effects(
+        self,
+        source_name: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / source_name
+        source_data = b"source must remain untouched"
+        source_path.write_bytes(source_data)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 2
+        assert captured.out == ""
+        assert captured.err.endswith(
+            "cbzfit: error: When DESTINATION is omitted, SOURCE must have "
+            "a .cbz or .zip extension.\n"
+        )
+        assert source_path.read_bytes() == source_data
+        assert sorted(tmp_path.iterdir()) == [source_path]
+        assert list(tmp_path.rglob(".*.tmp")) == []
+
+    @pytest.mark.parametrize("extension", ["cbz", "zip"])
+    def test_archive_is_processed_to_derived_destination_end_to_end(
+        self,
+        extension: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / f"Manga Volume 01.{extension}"
+        destination_path = tmp_path / f"Manga Volume 01 [CBZFit].{extension}"
+        create_valid_cli_source_archive(source_path)
+        source_data = source_path.read_bytes()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+            ],
+        )
+
+        assert main() == 0
+
+        captured = capsys.readouterr()
+        assert captured.out.startswith(f"Output: {destination_path} completed in ")
+        assert captured.err == ""
+        assert source_path.read_bytes() == source_data
+        assert destination_path.is_file()
+        with ZipFile(destination_path, mode="r") as archive:
+            assert archive.testzip() is None
+            assert archive.namelist() == ["001.png"]
+
+    def test_invalid_content_with_allowed_extension_uses_normal_validation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "invalid.cbz"
+        destination_path = tmp_path / "invalid [CBZFit].cbz"
+        source_path.write_bytes(b"not a ZIP archive")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == (
+            f"cbzfit: error: File is not a valid ZIP archive: {source_path}.\n"
+        )
+        assert not destination_path.exists()
+
+    def test_existing_derived_destination_is_not_replaced_by_default(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "book.cbz"
+        destination_path = tmp_path / "book [CBZFit].cbz"
+        create_valid_cli_source_archive(source_path)
+        source_data = source_path.read_bytes()
+        existing_data = b"existing destination"
+        destination_path.write_bytes(existing_data)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        captured = capsys.readouterr()
+        assert exception_info.value.code == 1
+        assert captured.out == ""
+        assert captured.err == (
+            f"cbzfit: error: Destination archive already exists: "
+            f"{destination_path}.\n"
+        )
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() == existing_data
+        assert list(tmp_path.glob(f".{destination_path.name}.*.tmp")) == []
+
+    def test_replace_atomically_publishes_over_existing_derived_destination(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source_path = tmp_path / "book.cbz"
+        destination_path = tmp_path / "book [CBZFit].cbz"
+        create_valid_cli_source_archive(source_path)
+        source_data = source_path.read_bytes()
+        destination_path.write_bytes(b"old generated archive")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--conflict",
+                "replace",
+            ],
+        )
+
+        assert main() == 0
+
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() != b"old generated archive"
+        with ZipFile(destination_path, mode="r") as archive:
+            assert archive.testzip() is None
+        assert capsys.readouterr().out.startswith(
+            f"Output: {destination_path} completed in "
+        )
+
+    def test_generated_source_derives_a_second_marker_without_in_place_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "book [CBZFit].cbz"
+        destination_path = tmp_path / "book [CBZFit] [CBZFit].cbz"
+        create_valid_cli_source_archive(source_path)
+        source_data = source_path.read_bytes()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source_path),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--conflict",
+                "replace",
+            ],
+        )
+
+        assert main() == 0
+        assert source_path.read_bytes() == source_data
+        assert destination_path.is_file()
 
 
 class CapturedErrorStream(StringIO):
