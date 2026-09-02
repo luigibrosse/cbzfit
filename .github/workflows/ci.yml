@@ -71,6 +71,27 @@ jobs:
 
       - name: Validate distribution metadata
         run: python -m twine check --strict dist/*
+      - name: Verify changelog in source distribution
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tarfile import open as open_tar
+
+          source_distributions = list(Path("dist").glob("*.tar.gz"))
+          assert len(source_distributions) == 1, source_distributions
+
+          with open_tar(source_distributions[0], mode="r:gz") as archive:
+              changelog_paths = [
+                  member.name
+                  for member in archive.getmembers()
+                  if Path(member.name).name == "CHANGELOG.md"
+              ]
+
+          assert len(changelog_paths) == 1, changelog_paths
+          changelog_parts = Path(changelog_paths[0]).parts
+          assert len(changelog_parts) == 2, changelog_parts
+          assert changelog_parts[-1] == "CHANGELOG.md"
+          PY
 
       - name: Create clean environment
         run: python -m venv .package-smoke
