@@ -102,6 +102,17 @@ python -m pytest --cov=cbzfit --cov-branch --cov-report=term-missing --cov-fail-
 python -m ruff check .
 ```
 
+## Versioning
+
+CBZFit follows [Semantic Versioning](https://semver.org/). Version 0.1.0 is an
+initial pre-1.0 release. Before 1.0, minor releases may introduce documented
+CLI or behavior changes. Patch releases are intended for backward-compatible
+fixes and documentation or packaging corrections.
+
+User-visible changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+`src/cbzfit/__init__.py` is the authoritative version source through
+`cbzfit.__version__`; Hatchling derives the package metadata version from it.
+
 ## License
 
 CBZFit is licensed under the GNU General Public License v3.0 or later.

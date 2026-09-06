@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cbzfit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Resize manga and comic CBZ archives for e-readers and other displays."
 keywords = ["cbz", "manga", "comics", "image-resizing", "e-reader"]
 classifiers = [
@@ -43,6 +43,9 @@ cbzfit = "cbzfit.cli:main"
 Homepage = "https://github.com/luigibrosse/cbzfit"
 Repository = "https://github.com/luigibrosse/cbzfit"
 Issues = "https://github.com/luigibrosse/cbzfit/issues"
+
+[tool.hatch.version]
+path = "src/cbzfit/__init__.py"
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib"]
