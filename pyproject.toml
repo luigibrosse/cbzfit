@@ -43,6 +43,7 @@ cbzfit = "cbzfit.cli:main"
 Homepage = "https://github.com/luigibrosse/cbzfit"
 Repository = "https://github.com/luigibrosse/cbzfit"
 Issues = "https://github.com/luigibrosse/cbzfit/issues"
+Changelog = "https://github.com/luigibrosse/cbzfit/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "src/cbzfit/__init__.py"
