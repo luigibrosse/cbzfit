@@ -1,0 +1,240 @@
+name: Test release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require the main branch
+        run: test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packaging tools
+        run: python -m pip install --upgrade pip build twine
+
+      # The default build flow creates the wheel from the generated source
+      # distribution, verifying that the source distribution is complete.
+      - name: Build source and wheel distributions
+        run: python -m build
+
+      - name: Validate distribution metadata
+        run: python -m twine check --strict dist/*
+
+      - name: Verify changelog in source distribution
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tarfile import open as open_tar
+
+          source_distributions = list(Path("dist").glob("*.tar.gz"))
+          assert len(source_distributions) == 1, source_distributions
+
+          with open_tar(source_distributions[0], mode="r:gz") as archive:
+              changelog_paths = [
+                  member.name
+                  for member in archive.getmembers()
+                  if Path(member.name).name == "CHANGELOG.md"
+              ]
+
+          assert len(changelog_paths) == 1, changelog_paths
+          changelog_parts = Path(changelog_paths[0]).parts
+          assert len(changelog_parts) == 2, changelog_parts
+          assert changelog_parts[-1] == "CHANGELOG.md"
+          PY
+
+      - name: Inspect wheel contents
+        run: |
+          python - <<'PY'
+          import csv
+          from io import StringIO
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          wheel = wheels[0]
+          assert wheel.name.endswith("-py3-none-any.whl"), wheel.name
+
+          with ZipFile(wheel, mode="r") as archive:
+              members = archive.infolist()
+              assert not any(member.is_dir() for member in members), members
+              actual_files = {member.filename for member in members}
+
+              metadata_paths = {
+                  path
+                  for path in actual_files
+                  if path.endswith(".dist-info/METADATA")
+              }
+              assert len(metadata_paths) == 1, metadata_paths
+              metadata_path = metadata_paths.pop()
+              dist_info = metadata_path.removesuffix("/METADATA")
+
+              expected_files = {
+                  "cbzfit/__init__.py",
+                  "cbzfit/__main__.py",
+                  "cbzfit/archive.py",
+                  "cbzfit/cli.py",
+                  "cbzfit/decode.py",
+                  "cbzfit/encode.py",
+                  "cbzfit/image.py",
+                  "cbzfit/process.py",
+                  "cbzfit/progress.py",
+                  f"{dist_info}/METADATA",
+                  f"{dist_info}/WHEEL",
+                  f"{dist_info}/entry_points.txt",
+                  f"{dist_info}/licenses/LICENSE",
+                  f"{dist_info}/RECORD",
+              }
+
+              missing_files = expected_files - actual_files
+              unexpected_files = actual_files - expected_files
+              assert not missing_files, sorted(missing_files)
+              assert not unexpected_files, sorted(unexpected_files)
+
+              record_text = archive.read(f"{dist_info}/RECORD").decode("utf-8")
+              recorded_files = {
+                  row[0]
+                  for row in csv.reader(StringIO(record_text))
+              }
+
+          assert recorded_files == actual_files, {
+              "missing_from_record": sorted(actual_files - recorded_files),
+              "unexpected_in_record": sorted(recorded_files - actual_files),
+          }
+          PY
+
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: cbzfit-test-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/cbzfit
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: cbzfit-test-distributions
+          path: dist
+
+      - name: Publish distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  verify-testpypi:
+    name: Verify TestPyPI package
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Create clean environment
+        run: python -m venv .testpypi-smoke
+
+      - name: Install runtime dependency from PyPI
+        run: >-
+          .testpypi-smoke/bin/python -m pip install
+          --upgrade
+          "Pillow>=12"
+
+      - name: Install CBZFit from TestPyPI
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if .testpypi-smoke/bin/python -m pip install \
+              --index-url https://test.pypi.org/simple/ \
+              --no-cache-dir \
+              --no-deps \
+              cbzfit==0.1.0; then
+              exit 0
+            fi
+
+            if [ "$attempt" -eq 6 ]; then
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+      - name: Verify installed entry points
+        run: |
+          test "$(.testpypi-smoke/bin/cbzfit --version)" = "cbzfit 0.1.0"
+          test "$(.testpypi-smoke/bin/python -m cbzfit --version)" = "cbzfit 0.1.0"
+
+      - name: Process a generated CBZ with TestPyPI package
+        run: |
+          .testpypi-smoke/bin/python - <<'PY'
+          from io import BytesIO
+          from zipfile import ZipFile
+
+          from PIL import Image
+
+          image_stream = BytesIO()
+          with Image.new("RGB", (20, 40), "white") as image:
+              image.save(image_stream, format="PNG")
+
+          with ZipFile("smoke-source.cbz", mode="w") as archive:
+              archive.writestr("001.png", image_stream.getvalue())
+          PY
+
+          .testpypi-smoke/bin/cbzfit \
+            smoke-source.cbz \
+            --screen-width 10 \
+            --screen-height 20 \
+            --verify crc \
+            --no-progress
+
+          .testpypi-smoke/bin/python - <<'PY'
+          from io import BytesIO
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from PIL import Image
+
+          source_path = Path("smoke-source.cbz")
+          output_path = Path("smoke-source [CBZFit].cbz")
+
+          assert source_path.is_file()
+          assert output_path.is_file()
+
+          with ZipFile(output_path, mode="r") as archive:
+              assert archive.testzip() is None
+              assert archive.namelist() == ["001.png"]
+              with Image.open(BytesIO(archive.read("001.png"))) as image:
+                  image.load()
+                  assert image.format == "PNG"
+                  assert image.size == (10, 20)
+          PY
