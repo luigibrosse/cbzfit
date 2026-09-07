@@ -151,6 +151,8 @@ CBZFit rejects:
 
 ## Development
 
+Contributions and development checks should be performed on a dedicated branch.
+
 Clone the repository and create a virtual environment:
 
 ```console
