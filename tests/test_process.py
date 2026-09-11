@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
+import warnings
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
@@ -25,6 +26,7 @@ from cbzfit.archive import (
     MemberDateTimePolicy,
 )
 from cbzfit.decode import (
+    DEFAULT_MAX_IMAGE_PIXELS,
     UnsupportedImageContentError,
     UnsupportedImageFormatError,
 )
@@ -159,6 +161,7 @@ class TestImageProcessingOptions:
 
         assert options.use_landscape_display is True
         assert options.allow_upscale is False
+        assert options.max_image_pixels == DEFAULT_MAX_IMAGE_PIXELS
         assert options.encoder_options == EncoderOptions()
 
     def test_custom_options_are_retained(self) -> None:
@@ -170,13 +173,50 @@ class TestImageProcessingOptions:
             portrait_screen_size=(1404, 1872),
             use_landscape_display=False,
             allow_upscale=True,
+            max_image_pixels=75_000_000,
             encoder_options=encoder_options,
         )
 
         assert options.portrait_screen_size == (1404, 1872)
         assert options.use_landscape_display is False
         assert options.allow_upscale is True
+        assert options.max_image_pixels == 75_000_000
         assert options.encoder_options is encoder_options
+
+    @pytest.mark.parametrize(
+        "max_image_pixels",
+        [True, False, 1.5, "100"],
+    )
+    def test_non_integer_maximum_pixel_count_is_rejected(
+        self,
+        max_image_pixels: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Maximum image pixel count must be an integer."
+            ),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                max_image_pixels=max_image_pixels,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("max_image_pixels", [0, -1])
+    def test_non_positive_maximum_pixel_count_is_rejected(
+        self,
+        max_image_pixels: int,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Maximum image pixel count must be a positive integer."
+            ),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                max_image_pixels=max_image_pixels,
+            )
 
     def test_default_encoder_options_are_not_shared(self) -> None:
         first_options = ImageProcessingOptions(
@@ -552,6 +592,66 @@ class TestProcessImageData:
                 ),
             )
 
+    @pytest.mark.parametrize(
+        ("size", "max_image_pixels"),
+        [
+            ((9, 10), 100),
+            ((10, 10), 100),
+        ],
+    )
+    def test_image_at_or_below_pixel_limit_is_processed(
+        self,
+        size: tuple[int, int],
+        max_image_pixels: int,
+    ) -> None:
+        source_data = create_encoded_image("PNG", size=size)
+
+        result = process_image_data(
+            source_data,
+            "001.png",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                max_image_pixels=max_image_pixels,
+            ),
+        )
+
+        assert result.data is source_data
+        assert result.transformed is False
+
+    @pytest.mark.parametrize("size", [(10, 11), (11, 10)])
+    def test_image_above_pixel_limit_is_rejected_before_loading(
+        self,
+        size: tuple[int, int],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        filename = "001.png"
+        image = create_mock_opened_image()
+        image.format = "PNG"
+        image.size = size
+        monkeypatch.setattr(
+            process_module.Image,
+            "open",
+            Mock(return_value=image),
+        )
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(
+                f"Image dimensions exceed the permitted limit: {filename!r}."
+            ),
+        ):
+            process_image_data(
+                b"encoded-image-data",
+                filename,
+                options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                    max_image_pixels=100,
+                ),
+            )
+
+        image.load.assert_not_called()
+        image.__exit__.assert_called_once()
+
     def test_invalid_image_data_is_rejected(self) -> None:
         filename = "001.jpg"
         expected_message = (
@@ -609,14 +709,12 @@ class TestProcessImageData:
         assert exception_info.value.__cause__ is error
         open_image.assert_called_once()
 
-    def test_image_decompression_bomb_is_rejected(
+    def test_image_decompression_bomb_error_during_opening_is_rejected(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         filename = "001.jpg"
-        error = Image.DecompressionBombError(
-            "Image size exceeds limit"
-        )
+        error = Image.DecompressionBombError("Image size exceeds limit")
         expected_message = (
             "Image dimensions exceed the permitted limit: "
             f"{filename!r}."
@@ -641,6 +739,46 @@ class TestProcessImageData:
             )
 
         assert exception_info.value.__cause__ is error
+
+    def test_decompression_bomb_warning_during_opening_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        filename = "001.jpg"
+        expected_message = (
+            "Image dimensions exceed the permitted limit: "
+            f"{filename!r}."
+        )
+
+        def open_image(*args: object, **kwargs: object) -> None:
+            warnings.warn(
+                "Image size exceeds limit",
+                Image.DecompressionBombWarning,
+                stacklevel=1,
+            )
+
+        monkeypatch.setattr(
+            process_module.Image,
+            "open",
+            open_image,
+        )
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            process_image_data(
+                b"encoded-image-data",
+                filename,
+                options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            )
+
+        assert isinstance(
+            exception_info.value.__cause__,
+            Image.DecompressionBombWarning,
+        )
 
     def test_pixel_decoding_failure_is_wrapped(
         self,
@@ -675,15 +813,13 @@ class TestProcessImageData:
         assert exception_info.value.__cause__ is error
         image.__exit__.assert_called_once()
 
-    def test_decompression_bomb_during_pixel_loading_is_rejected(
+    def test_decompression_bomb_error_during_pixel_loading_is_rejected(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         filename = "001.jpg"
         image = create_mock_opened_image()
-        error = Image.DecompressionBombError(
-            "Image size exceeds limit"
-        )
+        error = Image.DecompressionBombError("Image size exceeds limit")
         image.load.side_effect = error
         expected_message = (
             "Image dimensions exceed the permitted limit: "
@@ -710,6 +846,65 @@ class TestProcessImageData:
 
         assert exception_info.value.__cause__ is error
         image.__exit__.assert_called_once()
+
+    def test_decompression_bomb_warning_during_pixel_loading_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        filename = "001.jpg"
+        image = create_mock_opened_image()
+        expected_message = (
+            "Image dimensions exceed the permitted limit: "
+            f"{filename!r}."
+        )
+
+        def load_image() -> None:
+            warnings.warn(
+                "Image size exceeds limit",
+                Image.DecompressionBombWarning,
+                stacklevel=1,
+            )
+
+        image.load.side_effect = load_image
+        monkeypatch.setattr(
+            process_module.Image,
+            "open",
+            Mock(return_value=image),
+        )
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(expected_message),
+        ) as exception_info:
+            process_image_data(
+                b"encoded-image-data",
+                filename,
+                options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            )
+
+        assert isinstance(
+            exception_info.value.__cause__,
+            Image.DecompressionBombWarning,
+        )
+        image.__exit__.assert_called_once()
+
+    def test_decompression_bomb_warning_filter_is_local(
+        self,
+    ) -> None:
+        filters_before = warnings.filters.copy()
+        source_data = create_encoded_image("PNG", size=(10, 20))
+
+        process_image_data(
+            source_data,
+            "001.png",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+
+        assert warnings.filters == filters_before
 
     def test_animated_image_is_rejected(
         self,
@@ -2510,6 +2705,40 @@ class TestProcessArchiveFile:
                 + len(unchanged_image)
             ),
         )
+    def test_pixel_limit_failure_preserves_files_and_removes_temporary_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        source_image = create_encoded_image("PNG", size=(10, 11))
+        create_archive_file(source_path, [("001.png", source_image)])
+        source_data = source_path.read_bytes()
+        destination_data = b"existing destination"
+        destination_path.write_bytes(destination_data)
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(
+                "Image dimensions exceed the permitted limit: '001.png'."
+            ),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                        max_image_pixels=100,
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() == destination_data
+        assert temporary_archive_paths(destination_path) == []
+
     def test_archives_are_closed_before_publication(
         self,
         tmp_path: Path,
