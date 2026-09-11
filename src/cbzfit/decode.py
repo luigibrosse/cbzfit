@@ -18,6 +18,8 @@ EXTENSION_FORMATS = {
     ".webp": "WEBP",
 }
 
+DEFAULT_MAX_IMAGE_PIXELS = 50_000_000
+
 
 class UnsupportedImageFormatError(ValueError):
     """Raised when an image format is missing, unsupported, or inconsistent."""
@@ -37,6 +39,21 @@ def normalize_image_format(image_format: str) -> str:
         raise UnsupportedImageFormatError(
             f"Unsupported image format: {image_format!r}."
         ) from error
+
+
+def validate_image_dimensions(
+    image: Image.Image,
+    filename: str,
+    *,
+    max_pixels: int,
+) -> None:
+    """Validate source dimensions against a configured pixel limit."""
+    width, height = image.size
+
+    if width * height > max_pixels:
+        raise UnsupportedImageContentError(
+            f"Image dimensions exceed the permitted limit: {filename!r}."
+        )
 
 
 def validate_source_image(

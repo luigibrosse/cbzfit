@@ -8,9 +8,11 @@ import pytest
 from PIL import Image
 
 from cbzfit.decode import (
+    DEFAULT_MAX_IMAGE_PIXELS,
     UnsupportedImageContentError,
     UnsupportedImageFormatError,
     normalize_image_format,
+    validate_image_dimensions,
     validate_source_image,
 )
 
@@ -85,6 +87,71 @@ class TestNormalizeImageFormat:
             match=exact_message(expected_message),
         ):
             normalize_image_format(image_format)
+
+
+class TestValidateImageDimensions:
+    def test_default_limit_is_positive(self) -> None:
+        assert DEFAULT_MAX_IMAGE_PIXELS == 50_000_000
+
+    def test_image_at_default_pixel_limit_is_accepted(self) -> None:
+        image = Mock(spec=Image.Image)
+        image.size = (10_000, 5_000)
+
+        validate_image_dimensions(
+            image,
+            "large.png",
+            max_pixels=DEFAULT_MAX_IMAGE_PIXELS,
+        )
+
+    @pytest.mark.parametrize(
+        "size",
+        [
+            (9, 10),
+            (10, 9),
+            (10, 10),
+        ],
+    )
+    def test_image_at_or_below_pixel_limit_is_accepted(
+        self,
+        size: tuple[int, int],
+    ) -> None:
+        image = Mock(spec=Image.Image)
+        image.size = size
+
+        validate_image_dimensions(
+            image,
+            "001.png",
+            max_pixels=100,
+        )
+
+    @pytest.mark.parametrize(
+        "size",
+        [
+            (10, 11),
+            (11, 10),
+        ],
+    )
+    def test_image_above_pixel_limit_is_rejected(
+        self,
+        size: tuple[int, int],
+    ) -> None:
+        filename = "001.png"
+        image = Mock(spec=Image.Image)
+        image.size = size
+        expected_message = (
+            f"Image dimensions exceed the permitted limit: {filename!r}."
+        )
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(expected_message),
+        ):
+            validate_image_dimensions(
+                image,
+                filename,
+                max_pixels=100,
+            )
+
 
 class TestValidateSourceImage:
 

@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter
+from warnings import catch_warnings, simplefilter
 from zipfile import (
     ZIP_DEFLATED,
     ZIP_STORED,
@@ -31,7 +32,9 @@ from cbzfit.archive import (
     write_member_data,
 )
 from cbzfit.decode import (
+    DEFAULT_MAX_IMAGE_PIXELS,
     UnsupportedImageContentError,
+    validate_image_dimensions,
     validate_source_image,
 )
 from cbzfit.encode import (
@@ -61,6 +64,7 @@ class ImageProcessingOptions:
     portrait_screen_size: tuple[int, int]
     use_landscape_display: bool = True
     allow_upscale: bool = False
+    max_image_pixels: int = DEFAULT_MAX_IMAGE_PIXELS
     encoder_options: EncoderOptions = field(
         default_factory=EncoderOptions
     )
@@ -70,6 +74,19 @@ class ImageProcessingOptions:
         validate_portrait_screen_size(
             self.portrait_screen_size
         )
+
+        if (
+            isinstance(self.max_image_pixels, bool)
+            or not isinstance(self.max_image_pixels, int)
+        ):
+            raise TypeError(
+                "Maximum image pixel count must be an integer."
+            )
+
+        if self.max_image_pixels <= 0:
+            raise ValueError(
+                "Maximum image pixel count must be a positive integer."
+            )
 
 
 @dataclass(frozen=True)
@@ -159,59 +176,72 @@ def process_image_data(
     Original encoded bytes are returned unchanged when the image already fits
     the target display and upscaling is disabled.
     """
-    try:
-        image = Image.open(
-            BytesIO(data),
-        )
-    except Image.DecompressionBombError as error:
-        raise UnsupportedImageContentError(
-            f"Image dimensions exceed the permitted limit: {filename!r}."
-        ) from error
-    except (UnidentifiedImageError, OSError) as error:
-        raise UnsupportedImageContentError(
-            f"Image data could not be decoded: {filename!r}."
-        ) from error
-
-    with image:
-        source_format = validate_source_image(
-            image=image,
-            filename=filename,
-        )
+    with catch_warnings():
+        simplefilter("error", Image.DecompressionBombWarning)
 
         try:
-            image.load()
-        except Image.DecompressionBombError as error:
+            image = Image.open(
+                BytesIO(data),
+            )
+        except (
+            Image.DecompressionBombWarning,
+            Image.DecompressionBombError,
+        ) as error:
             raise UnsupportedImageContentError(
                 f"Image dimensions exceed the permitted limit: {filename!r}."
             ) from error
-        except OSError as error:
+        except (UnidentifiedImageError, OSError) as error:
             raise UnsupportedImageContentError(
                 f"Image data could not be decoded: {filename!r}."
             ) from error
 
-        resized_image = resize_for_display(
-            image=image,
-            portrait_screen_size=options.portrait_screen_size,
-            use_landscape_display=options.use_landscape_display,
-            allow_upscale=options.allow_upscale,
-        )
-
-        if resized_image is image:
-            return ProcessedImage(
-                data=data,
-                format=source_format,
-                transformed=False,
+        with image:
+            source_format = validate_source_image(
+                image=image,
+                filename=filename,
+            )
+            validate_image_dimensions(
+                image=image,
+                filename=filename,
+                max_pixels=options.max_image_pixels,
             )
 
-        try:
-            encoded_image = encode_image(
-                resized_image,
-                output_format=source_format,
-                options=options.encoder_options,
-            )
-        finally:
-            resized_image.close()
+            try:
+                image.load()
+            except (
+                Image.DecompressionBombWarning,
+                Image.DecompressionBombError,
+            ) as error:
+                raise UnsupportedImageContentError(
+                    f"Image dimensions exceed the permitted limit: {filename!r}."
+                ) from error
+            except OSError as error:
+                raise UnsupportedImageContentError(
+                    f"Image data could not be decoded: {filename!r}."
+                ) from error
 
+            resized_image = resize_for_display(
+                image=image,
+                portrait_screen_size=options.portrait_screen_size,
+                use_landscape_display=options.use_landscape_display,
+                allow_upscale=options.allow_upscale,
+            )
+
+            if resized_image is image:
+                return ProcessedImage(
+                    data=data,
+                    format=source_format,
+                    transformed=False,
+                )
+
+            try:
+                encoded_image = encode_image(
+                    resized_image,
+                    output_format=source_format,
+                    options=options.encoder_options,
+                )
+            finally:
+                resized_image.close()
     return ProcessedImage(
         data=encoded_image.data,
         format=encoded_image.format,
