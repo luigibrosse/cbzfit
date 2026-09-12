@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -29,6 +30,38 @@ DEFAULT_MAX_MEMBER_PATH_LENGTH = 1_024
 DEFAULT_MAX_PATH_COMPONENT_LENGTH = 255
 DEFAULT_MEMBER_READ_CHUNK_SIZE = 64 * 1024
 ARCHIVE_MEMBER_READ_ERRORS = (BadZipFile, EOFError, OSError, RuntimeError)
+
+ZIP_CREATOR_DOS = 0
+ZIP_CREATOR_UNIX = 3
+DEFAULT_UNIX_FILE_PERMISSIONS = 0o644
+
+DOS_ATTRIBUTE_READ_ONLY = 0x01
+DOS_ATTRIBUTE_HIDDEN = 0x02
+DOS_ATTRIBUTE_SYSTEM = 0x04
+DOS_ATTRIBUTE_VOLUME_LABEL = 0x08
+DOS_ATTRIBUTE_DIRECTORY = 0x10
+DOS_ATTRIBUTE_ARCHIVE = 0x20
+DOS_ATTRIBUTE_DEVICE = 0x40
+DOS_ATTRIBUTE_NORMAL = 0x80
+DOS_ATTRIBUTE_TEMPORARY = 0x100
+DOS_ATTRIBUTE_SPARSE_FILE = 0x200
+DOS_ATTRIBUTE_REPARSE_POINT = 0x400
+DOS_ATTRIBUTE_COMPRESSED = 0x800
+DOS_ATTRIBUTE_OFFLINE = 0x1000
+DOS_ATTRIBUTE_NOT_CONTENT_INDEXED = 0x2000
+DOS_ATTRIBUTE_ENCRYPTED = 0x4000
+DOS_ATTRIBUTE_VIRTUAL = 0x10000
+DOS_SAFE_FILE_ATTRIBUTES = (
+    DOS_ATTRIBUTE_READ_ONLY
+    | DOS_ATTRIBUTE_HIDDEN
+    | DOS_ATTRIBUTE_SYSTEM
+    | DOS_ATTRIBUTE_ARCHIVE
+)
+DOS_REJECTED_ATTRIBUTES = (
+    DOS_ATTRIBUTE_VOLUME_LABEL
+    | DOS_ATTRIBUTE_DEVICE
+    | DOS_ATTRIBUTE_REPARSE_POINT
+)
 
 ZipDateTime = tuple[int, int, int, int, int, int]
 
@@ -271,6 +304,106 @@ def validate_member_path(
     return normalized_path
 
 
+def validate_member_type(member: ZipInfo) -> None:
+    """Validate that a ZIP member is a regular file or directory marker."""
+    is_directory_path = member.filename.endswith("/")
+
+    if member.create_system == ZIP_CREATOR_UNIX:
+        unix_mode = member.external_attr >> 16
+        file_type = stat.S_IFMT(unix_mode)
+
+        if file_type == 0:
+            return
+
+        if stat.S_ISREG(unix_mode):
+            if is_directory_path:
+                raise InvalidArchiveError(
+                    "ZIP member type conflicts with its path: "
+                    f"{member.filename!r}."
+                )
+            return
+
+        if stat.S_ISDIR(unix_mode):
+            if not is_directory_path:
+                raise InvalidArchiveError(
+                    "ZIP member type conflicts with its path: "
+                    f"{member.filename!r}."
+                )
+            return
+
+        special_types = (
+            (stat.S_ISLNK, "symbolic link"),
+            (stat.S_ISCHR, "character device"),
+            (stat.S_ISBLK, "block device"),
+            (stat.S_ISFIFO, "FIFO"),
+            (stat.S_ISSOCK, "socket"),
+        )
+        for type_check, type_name in special_types:
+            if type_check(unix_mode):
+                raise InvalidArchiveError(
+                    f"Unsupported ZIP member type for {member.filename!r}: "
+                    f"{type_name}."
+                )
+
+        raise InvalidArchiveError(
+            f"Unsupported ZIP member type for {member.filename!r}."
+        )
+
+    if member.create_system == ZIP_CREATOR_DOS:
+        dos_attributes = member.external_attr & 0xFFFF
+
+        if (
+            dos_attributes & DOS_ATTRIBUTE_NORMAL
+            and dos_attributes != DOS_ATTRIBUTE_NORMAL
+        ):
+            raise InvalidArchiveError(
+                "ZIP member has inconsistent DOS attributes: "
+                f"{member.filename!r}."
+            )
+
+        if dos_attributes & DOS_REJECTED_ATTRIBUTES:
+            raise InvalidArchiveError(
+                f"Unsupported ZIP member type for {member.filename!r}."
+            )
+
+        has_directory_attribute = bool(
+            dos_attributes & DOS_ATTRIBUTE_DIRECTORY
+        )
+        if has_directory_attribute != is_directory_path:
+            raise InvalidArchiveError(
+                "ZIP member type conflicts with its path: "
+                f"{member.filename!r}."
+            )
+
+        return
+
+    # Unknown creator systems carry no type metadata that CBZFit can
+    # interpret safely. The validated trailing slash determines whether
+    # the member is a directory marker.
+    return
+
+
+def resolve_output_member_attributes(member: ZipInfo) -> tuple[int, int]:
+    """Return a safe creator system and external attributes for output."""
+    if member.create_system == ZIP_CREATOR_UNIX:
+        source_mode = member.external_attr >> 16
+        permissions = stat.S_IMODE(source_mode) & 0o777
+        if permissions == 0:
+            permissions = DEFAULT_UNIX_FILE_PERMISSIONS
+        output_mode = stat.S_IFREG | permissions
+        return ZIP_CREATOR_UNIX, output_mode << 16
+
+    if member.create_system == ZIP_CREATOR_DOS:
+        source_attributes = member.external_attr & 0xFFFF
+        safe_attributes = source_attributes & DOS_SAFE_FILE_ATTRIBUTES
+        if safe_attributes == 0:
+            safe_attributes = DOS_ATTRIBUTE_NORMAL
+        return ZIP_CREATOR_DOS, safe_attributes
+
+    output_mode = stat.S_IFREG | DEFAULT_UNIX_FILE_PERMISSIONS
+    return ZIP_CREATOR_UNIX, output_mode << 16
+
+
 def read_member_data(
     archive: ZipFile,
     member: ZipInfo,
@@ -429,9 +562,11 @@ def _clone_member_info(
     )
     output_member.compress_type = compression
     output_member.comment = member.comment
-    output_member.create_system = member.create_system
     output_member.internal_attr = member.internal_attr
-    output_member.external_attr = member.external_attr
+    (
+        output_member.create_system,
+        output_member.external_attr,
+    ) = resolve_output_member_attributes(member)
 
     return output_member
 
@@ -508,35 +643,11 @@ def build_manifest(
             "Maximum total uncompressed size must be a positive integer."
         )
 
-    file_members = tuple(
-        member
-        for member in archive.infolist()
-        if not member.is_dir()
-    )
-
-    if not file_members:
-        raise InvalidArchiveError(
-            "The archive does not contain any files."
-        )
-
-    if len(file_members) > max_files:
-        raise InvalidArchiveError(
-            f"The archive exceeds the permitted file count of {max_files}."
-        )
-
-    total_uncompressed_size = sum(
-        member.file_size
-        for member in file_members
-    )
-
-    if total_uncompressed_size > max_total_uncompressed_size:
-        raise InvalidArchiveError(
-            "The archive's uncompressed contents exceed the permitted size."
-        )
-
+    all_members = tuple(archive.infolist())
+    file_members: list[ZipInfo] = []
     seen_paths: set[str] = set()
 
-    for member in file_members:
+    for member in all_members:
         normalized_path = validate_member_path(
             member.filename,
             limits=member_path_limits,
@@ -550,6 +661,36 @@ def build_manifest(
 
         seen_paths.add(normalized_path)
 
+        validate_member_type(member)
+
+        if member.filename.endswith("/"):
+            continue
+
+        file_members.append(member)
+
+    file_members_tuple = tuple(file_members)
+
+    if not file_members_tuple:
+        raise InvalidArchiveError(
+            "The archive does not contain any files."
+        )
+
+    if len(file_members_tuple) > max_files:
+        raise InvalidArchiveError(
+            f"The archive exceeds the permitted file count of {max_files}."
+        )
+
+    total_uncompressed_size = sum(
+        member.file_size
+        for member in file_members_tuple
+    )
+
+    if total_uncompressed_size > max_total_uncompressed_size:
+        raise InvalidArchiveError(
+            "The archive's uncompressed contents exceed the permitted size."
+        )
+
+    for member in file_members_tuple:
         if member.flag_bits & 0x1:
             raise InvalidArchiveError(
                 f"Encrypted archive members are not supported: "
@@ -571,7 +712,7 @@ def build_manifest(
     image_members: list[ZipInfo] = []
     other_members: list[ZipInfo] = []
 
-    for member in file_members:
+    for member in file_members_tuple:
         if has_supported_image_extension(member.filename):
             image_members.append(member)
         else:
@@ -583,7 +724,7 @@ def build_manifest(
         )
 
     return ArchiveManifest(
-        file_members=file_members,
+        file_members=file_members_tuple,
         image_members=tuple(image_members),
         other_members=tuple(other_members),
     )
