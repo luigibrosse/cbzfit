@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
+import stat
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -20,6 +21,25 @@ import pytest
 import cbzfit.archive as archive_module
 from cbzfit.archive import (
     DEFAULT_MEMBER_READ_CHUNK_SIZE,
+    DEFAULT_UNIX_FILE_PERMISSIONS,
+    DOS_ATTRIBUTE_ARCHIVE,
+    DOS_ATTRIBUTE_COMPRESSED,
+    DOS_ATTRIBUTE_DEVICE,
+    DOS_ATTRIBUTE_DIRECTORY,
+    DOS_ATTRIBUTE_ENCRYPTED,
+    DOS_ATTRIBUTE_HIDDEN,
+    DOS_ATTRIBUTE_NORMAL,
+    DOS_ATTRIBUTE_NOT_CONTENT_INDEXED,
+    DOS_ATTRIBUTE_OFFLINE,
+    DOS_ATTRIBUTE_READ_ONLY,
+    DOS_ATTRIBUTE_REPARSE_POINT,
+    DOS_ATTRIBUTE_SPARSE_FILE,
+    DOS_ATTRIBUTE_SYSTEM,
+    DOS_ATTRIBUTE_TEMPORARY,
+    DOS_ATTRIBUTE_VIRTUAL,
+    DOS_ATTRIBUTE_VOLUME_LABEL,
+    ZIP_CREATOR_DOS,
+    ZIP_CREATOR_UNIX,
     ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
@@ -33,7 +53,9 @@ from cbzfit.archive import (
     inspect_cbz,
     read_member_data,
     resolve_member_date_time,
+    resolve_output_member_attributes,
     validate_member_path,
+    validate_member_type,
     validate_zip_date_time,
     write_member_data,
 )
@@ -62,6 +84,19 @@ def create_archive(
 
     archive_stream.seek(0)
     return archive_stream
+
+def create_member(
+    filename: str,
+    *,
+    create_system: int,
+    external_attr: int,
+) -> ZipInfo:
+    """Create a ZIP member with explicit creator and external attributes."""
+    member = ZipInfo(filename)
+    member.create_system = create_system
+    member.external_attr = external_attr
+    return member
+
 
 class TrackingStream:
     """Track reads and closure of an in-memory member stream."""
@@ -569,6 +604,346 @@ class TestArchiveReadState:
             ArchiveReadState(total_size=-1)
 
 
+class TestValidateMemberType:
+    @pytest.mark.parametrize("permissions", [0, 0o600, 0o644, 0o755])
+    def test_unix_regular_file_is_accepted(self, permissions: int) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(stat.S_IFREG | permissions) << 16,
+        )
+
+        assert validate_member_type(member) is None
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["001.jpg", "Chapter 01/"],
+    )
+    def test_missing_unix_file_type_is_inferred_from_path(
+        self,
+        filename: str,
+    ) -> None:
+        member = create_member(
+            filename,
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=0o644 << 16,
+        )
+
+        assert validate_member_type(member) is None
+
+    def test_unix_directory_marker_is_accepted(self) -> None:
+        member = create_member(
+            "Chapter 01/",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(stat.S_IFDIR | 0o755) << 16,
+        )
+
+        assert validate_member_type(member) is None
+
+    @pytest.mark.parametrize(
+        ("file_type", "type_name"),
+        [
+            (stat.S_IFLNK, "symbolic link"),
+            (stat.S_IFCHR, "character device"),
+            (stat.S_IFBLK, "block device"),
+            (stat.S_IFIFO, "FIFO"),
+            (stat.S_IFSOCK, "socket"),
+        ],
+    )
+    def test_unix_special_member_is_rejected(
+        self,
+        file_type: int,
+        type_name: str,
+    ) -> None:
+        member = create_member(
+            "special",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(file_type | 0o644) << 16,
+        )
+        expected_message = (
+            f"Unsupported ZIP member type for 'special': {type_name}."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            validate_member_type(member)
+
+    def test_unknown_unix_special_type_is_rejected(self) -> None:
+        member = create_member(
+            "special",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(0xD000 | 0o644) << 16,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Unsupported ZIP member type for 'special'."
+            ),
+        ):
+            validate_member_type(member)
+
+    @pytest.mark.parametrize(
+        ("filename", "file_type"),
+        [("001.jpg/", stat.S_IFREG), ("Chapter 01", stat.S_IFDIR)],
+    )
+    def test_unix_type_and_path_conflict_is_rejected(
+        self,
+        filename: str,
+        file_type: int,
+    ) -> None:
+        member = create_member(
+            filename,
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(file_type | 0o644) << 16,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                f"ZIP member type conflicts with its path: {filename!r}."
+            ),
+        ):
+            validate_member_type(member)
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            0,
+            DOS_ATTRIBUTE_NORMAL,
+            DOS_ATTRIBUTE_READ_ONLY,
+            DOS_ATTRIBUTE_HIDDEN,
+            DOS_ATTRIBUTE_SYSTEM,
+            DOS_ATTRIBUTE_ARCHIVE,
+            DOS_ATTRIBUTE_READ_ONLY | DOS_ATTRIBUTE_HIDDEN,
+        ],
+    )
+    def test_dos_regular_file_with_safe_attributes_is_accepted(
+        self,
+        attributes: int,
+    ) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=attributes,
+        )
+
+        assert validate_member_type(member) is None
+
+    def test_dos_directory_marker_is_accepted(self) -> None:
+        member = create_member(
+            "Chapter 01/",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=DOS_ATTRIBUTE_DIRECTORY,
+        )
+
+        assert validate_member_type(member) is None
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            DOS_ATTRIBUTE_VOLUME_LABEL,
+            DOS_ATTRIBUTE_DEVICE,
+            DOS_ATTRIBUTE_REPARSE_POINT,
+        ],
+    )
+    def test_dos_special_member_is_rejected(self, attributes: int) -> None:
+        member = create_member(
+            "special",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=attributes,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Unsupported ZIP member type for 'special'."
+            ),
+        ):
+            validate_member_type(member)
+
+    def test_dos_directory_attribute_requires_directory_path(self) -> None:
+        member = create_member(
+            "Chapter 01",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=DOS_ATTRIBUTE_DIRECTORY,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "ZIP member type conflicts with its path: 'Chapter 01'."
+            ),
+        ):
+            validate_member_type(member)
+
+    @pytest.mark.parametrize(
+        "attributes",
+        [0, DOS_ATTRIBUTE_NORMAL],
+    )
+    def test_dos_directory_path_requires_directory_attribute(
+        self,
+        attributes: int,
+    ) -> None:
+        member = create_member(
+            "Chapter 01/",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=attributes,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "ZIP member type conflicts with its path: 'Chapter 01/'."
+            ),
+        ):
+            validate_member_type(member)
+
+    def test_dos_normal_attribute_must_be_used_alone(self) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=DOS_ATTRIBUTE_NORMAL | DOS_ATTRIBUTE_ARCHIVE,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "ZIP member has inconsistent DOS attributes: '001.jpg'."
+            ),
+        ):
+            validate_member_type(member)
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["001.jpg", "Chapter 01/"],
+    )
+    def test_unknown_creator_uses_path_type(
+        self,
+        filename: str,
+    ) -> None:
+        member = create_member(
+            filename,
+            create_system=99,
+            external_attr=0xFFFFFFFF,
+        )
+
+        assert validate_member_type(member) is None
+
+
+class TestResolveOutputMemberAttributes:
+    def test_safe_unix_permissions_are_preserved(self) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(stat.S_IFREG | 0o640) << 16,
+        )
+
+        create_system, external_attr = resolve_output_member_attributes(member)
+
+        assert create_system == ZIP_CREATOR_UNIX
+        assert external_attr >> 16 == stat.S_IFREG | 0o640
+
+    def test_unix_special_permission_bits_are_removed(self) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=(stat.S_IFREG | 0o7644) << 16,
+        )
+
+        _, external_attr = resolve_output_member_attributes(member)
+
+        assert external_attr >> 16 == stat.S_IFREG | 0o644
+
+    def test_missing_unix_permissions_use_safe_default(self) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_UNIX,
+            external_attr=stat.S_IFREG << 16,
+        )
+
+        _, external_attr = resolve_output_member_attributes(member)
+
+        assert external_attr >> 16 == (
+            stat.S_IFREG | DEFAULT_UNIX_FILE_PERMISSIONS
+        )
+
+    def test_safe_dos_attributes_are_preserved(self) -> None:
+        safe_attributes = (
+            DOS_ATTRIBUTE_READ_ONLY
+            | DOS_ATTRIBUTE_HIDDEN
+            | DOS_ATTRIBUTE_SYSTEM
+            | DOS_ATTRIBUTE_ARCHIVE
+        )
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=safe_attributes,
+        )
+
+        assert resolve_output_member_attributes(member) == (
+            ZIP_CREATOR_DOS,
+            safe_attributes,
+        )
+
+    @pytest.mark.parametrize(
+        "attribute",
+        [
+            DOS_ATTRIBUTE_TEMPORARY,
+            DOS_ATTRIBUTE_SPARSE_FILE,
+            DOS_ATTRIBUTE_COMPRESSED,
+            DOS_ATTRIBUTE_OFFLINE,
+            DOS_ATTRIBUTE_NOT_CONTENT_INDEXED,
+            DOS_ATTRIBUTE_ENCRYPTED,
+            DOS_ATTRIBUTE_VIRTUAL,
+        ],
+    )
+    def test_irrelevant_dos_attributes_are_dropped(
+        self,
+        attribute: int,
+    ) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=DOS_ATTRIBUTE_READ_ONLY | attribute,
+        )
+
+        assert resolve_output_member_attributes(member) == (
+            ZIP_CREATOR_DOS,
+            DOS_ATTRIBUTE_READ_ONLY,
+        )
+
+    @pytest.mark.parametrize("attributes", [0, DOS_ATTRIBUTE_NORMAL])
+    def test_dos_file_without_preserved_attributes_is_normalized(
+        self,
+        attributes: int,
+    ) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=attributes,
+        )
+
+        assert resolve_output_member_attributes(member) == (
+            ZIP_CREATOR_DOS,
+            DOS_ATTRIBUTE_NORMAL,
+        )
+
+    def test_unknown_creator_uses_safe_unix_metadata(self) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=99,
+            external_attr=0xFFFFFFFF,
+        )
+
+        assert resolve_output_member_attributes(member) == (
+            ZIP_CREATOR_UNIX,
+            (stat.S_IFREG | DEFAULT_UNIX_FILE_PERMISSIONS) << 16,
+        )
+
+
 class TestReadMemberData:
     def test_member_data_is_returned(self) -> None:
         content = b"archive member content"
@@ -1008,6 +1383,55 @@ class TestBuildManifest:
         ) == ("Chapter 01/001.jpg",)
 
 
+    @pytest.mark.parametrize(
+        ("file_type", "type_name"),
+        [
+            (stat.S_IFLNK, "symbolic link"),
+            (stat.S_IFCHR, "character device"),
+            (stat.S_IFBLK, "block device"),
+            (stat.S_IFIFO, "FIFO"),
+            (stat.S_IFSOCK, "socket"),
+        ],
+    )
+    def test_manifest_rejects_unix_special_member(
+        self,
+        file_type: int,
+        type_name: str,
+    ) -> None:
+        archive_stream = create_archive(
+            [("001.jpg", b"image"), ("special", b"target")],
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            special_member = archive.getinfo("special")
+            special_member.create_system = ZIP_CREATOR_UNIX
+            special_member.external_attr = (file_type | 0o644) << 16
+            with pytest.raises(
+                InvalidArchiveError,
+                match=exact_message(
+                    f"Unsupported ZIP member type for 'special': "
+                    f"{type_name}."
+                ),
+            ):
+                build_manifest(archive)
+
+    def test_directory_path_is_validated_before_being_omitted(self) -> None:
+        unsafe_directory = "../Chapter 01/"
+        archive_stream = create_archive(
+            [("temporary/", b""), ("001.jpg", b"image")],
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            archive.infolist()[0].filename = unsafe_directory
+            with pytest.raises(
+                InvalidArchiveError,
+                match=exact_message(
+                    f"Archive member has an unsafe path: "
+                    f"{unsafe_directory!r}."
+                ),
+            ):
+                build_manifest(archive)
+
     def test_empty_archive_is_rejected(self) -> None:
         archive_stream = create_archive([])
         expected_message = "The archive does not contain any files."
@@ -1148,6 +1572,42 @@ class TestBuildManifest:
             ):
                 build_manifest(archive)
 
+
+    def test_dos_filesystem_encryption_does_not_imply_zip_encryption(
+        self,
+    ) -> None:
+        archive_stream = create_archive(
+            [("001.jpg", b"image")],
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            member = archive.getinfo("001.jpg")
+            member.create_system = ZIP_CREATOR_DOS
+            member.external_attr = DOS_ATTRIBUTE_ENCRYPTED
+            manifest = build_manifest(archive)
+
+        assert manifest.file_members == (member,)
+
+    def test_zip_encryption_is_rejected_independently_of_dos_attributes(
+        self,
+    ) -> None:
+        archive_stream = create_archive(
+            [("001.jpg", b"image")],
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            member = archive.getinfo("001.jpg")
+            member.create_system = ZIP_CREATOR_DOS
+            member.external_attr = DOS_ATTRIBUTE_READ_ONLY
+            member.flag_bits |= 0x1
+
+            with pytest.raises(
+                InvalidArchiveError,
+                match=exact_message(
+                    "Encrypted archive members are not supported: '001.jpg'."
+                ),
+            ):
+                build_manifest(archive)
 
     def test_unsupported_compression_method_is_rejected(self) -> None:
         archive_stream = create_archive(
@@ -1387,6 +1847,29 @@ class TestCloneMemberInfo:
         assert result.file_size == 0
         assert result.extra == b""
 
+    def test_dos_metadata_is_sanitized(self) -> None:
+        member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=(
+                DOS_ATTRIBUTE_HIDDEN
+                | DOS_ATTRIBUTE_ARCHIVE
+                | DOS_ATTRIBUTE_TEMPORARY
+            ),
+        )
+
+        result = archive_module._clone_member_info(
+            member,
+            date_time=(2026, 8, 22, 16, 30, 58),
+            compression=ZIP_STORED,
+            path_limits=ArchivePathLimits(),
+        )
+
+        assert result.create_system == ZIP_CREATOR_DOS
+        assert result.external_attr == (
+            DOS_ATTRIBUTE_HIDDEN | DOS_ATTRIBUTE_ARCHIVE
+        )
+
     def test_replacement_filename_is_normalized(self) -> None:
         member = ZipInfo("001.jpg")
 
@@ -1476,6 +1959,40 @@ class TestWriteMemberData:
             assert member.compress_type == compression
             assert member.date_time == source_member.date_time
             assert member.comment == source_member.comment
+
+    def test_dos_metadata_is_sanitized_when_written(self) -> None:
+        archive_stream = BytesIO()
+        source_member = create_member(
+            "001.jpg",
+            create_system=ZIP_CREATOR_DOS,
+            external_attr=(
+                DOS_ATTRIBUTE_READ_ONLY
+                | DOS_ATTRIBUTE_HIDDEN
+                | DOS_ATTRIBUTE_ENCRYPTED
+            ),
+        )
+
+        with ZipFile(archive_stream, mode="w") as archive:
+            write_member_data(
+                archive,
+                source_member,
+                b"image data",
+                compression=ZIP_STORED,
+                date_time_policy=MemberDateTimePolicy(
+                    mode=MemberDateTimeMode.PRESERVE,
+                ),
+                transformed=False,
+                path_limits=ArchivePathLimits(),
+            )
+
+        archive_stream.seek(0)
+        with ZipFile(archive_stream, mode="r") as archive:
+            output_member = archive.getinfo("001.jpg")
+            assert output_member.create_system == ZIP_CREATOR_DOS
+            assert output_member.external_attr == (
+                DOS_ATTRIBUTE_READ_ONLY | DOS_ATTRIBUTE_HIDDEN
+            )
+            assert archive.read(output_member) == b"image data"
 
     def test_replacement_filename_is_written(self) -> None:
         archive_stream = BytesIO()

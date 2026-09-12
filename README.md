@@ -144,6 +144,7 @@ CBZFit rejects:
 - invalid ZIP archives
 - animated images
 - encrypted archive members
+- symbolic links and other special ZIP member types
 - unsafe or duplicate member paths
 - unsupported ZIP compression methods
 - image content that does not match its filename extension

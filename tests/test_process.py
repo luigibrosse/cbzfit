@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import re
+import stat
 import warnings
 from io import BytesIO
 from pathlib import Path
@@ -10,6 +11,7 @@ from zipfile import (
     ZIP_STORED,
     BadZipFile,
     ZipFile,
+    ZipInfo,
 )
 
 import pytest
@@ -18,6 +20,13 @@ from PIL import Image, UnidentifiedImageError
 import cbzfit.process as process_module
 from cbzfit.archive import (
     DEFAULT_MAX_ARCHIVE_FILES,
+    DOS_ATTRIBUTE_ARCHIVE,
+    DOS_ATTRIBUTE_ENCRYPTED,
+    DOS_ATTRIBUTE_HIDDEN,
+    DOS_ATTRIBUTE_READ_ONLY,
+    DOS_ATTRIBUTE_TEMPORARY,
+    ZIP_CREATOR_DOS,
+    ZIP_CREATOR_UNIX,
     ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
@@ -1473,6 +1482,108 @@ class TestArchiveProgressReporting:
         assert temporary_archive_paths(destination_path) == []
 
 
+    def test_output_members_use_safe_regular_file_metadata(self) -> None:
+        source_stream = BytesIO()
+        destination_stream = BytesIO()
+        image_member = ZipInfo("001.png")
+        image_member.create_system = ZIP_CREATOR_UNIX
+        image_member.external_attr = (stat.S_IFREG | 0o7640) << 16
+        directory_member = ZipInfo("Chapter 01/")
+        directory_member.create_system = ZIP_CREATOR_UNIX
+        directory_member.external_attr = (stat.S_IFDIR | 0o755) << 16
+        metadata_member = ZipInfo("ComicInfo.xml")
+        metadata_member.create_system = ZIP_CREATOR_UNIX
+        metadata_member.external_attr = stat.S_IFREG << 16
+
+        with ZipFile(source_stream, mode="w") as source_archive:
+            source_archive.writestr(directory_member, b"")
+            source_archive.writestr(
+                image_member,
+                create_encoded_image("PNG", size=(20, 40)),
+            )
+            source_archive.writestr(metadata_member, b"<ComicInfo />")
+
+        source_stream.seek(0)
+        with (
+            ZipFile(source_stream, mode="r") as source_archive,
+            ZipFile(destination_stream, mode="w") as destination_archive,
+        ):
+            transform_archive_contents(
+                source_archive,
+                destination_archive,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        destination_stream.seek(0)
+        with ZipFile(destination_stream, mode="r") as destination_archive:
+            assert destination_archive.namelist() == [
+                "001.png",
+                "ComicInfo.xml",
+            ]
+            image_output = destination_archive.getinfo("001.png")
+            metadata_output = destination_archive.getinfo("ComicInfo.xml")
+
+        assert image_output.create_system == ZIP_CREATOR_UNIX
+        assert image_output.external_attr >> 16 == stat.S_IFREG | 0o640
+        assert metadata_output.create_system == ZIP_CREATOR_UNIX
+        assert metadata_output.external_attr >> 16 == stat.S_IFREG | 0o644
+
+
+    def test_dos_metadata_is_sanitized_through_transformation(self) -> None:
+        source_stream = BytesIO()
+        destination_stream = BytesIO()
+        image_member = ZipInfo("001.png")
+        image_member.create_system = ZIP_CREATOR_DOS
+        image_member.external_attr = (
+            DOS_ATTRIBUTE_READ_ONLY
+            | DOS_ATTRIBUTE_HIDDEN
+            | DOS_ATTRIBUTE_TEMPORARY
+            | DOS_ATTRIBUTE_ENCRYPTED
+        )
+        metadata_member = ZipInfo("ComicInfo.xml")
+        metadata_member.create_system = ZIP_CREATOR_DOS
+        metadata_member.external_attr = (
+            DOS_ATTRIBUTE_ARCHIVE | DOS_ATTRIBUTE_TEMPORARY
+        )
+
+        with ZipFile(source_stream, mode="w") as source_archive:
+            source_archive.writestr(
+                image_member,
+                create_encoded_image("PNG", size=(20, 40)),
+            )
+            source_archive.writestr(metadata_member, b"<ComicInfo />")
+
+        source_stream.seek(0)
+        with (
+            ZipFile(source_stream, mode="r") as source_archive,
+            ZipFile(destination_stream, mode="w") as destination_archive,
+        ):
+            transform_archive_contents(
+                source_archive,
+                destination_archive,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+            )
+
+        destination_stream.seek(0)
+        with ZipFile(destination_stream, mode="r") as destination_archive:
+            image_output = destination_archive.getinfo("001.png")
+            metadata_output = destination_archive.getinfo("ComicInfo.xml")
+            assert image_output.create_system == ZIP_CREATOR_DOS
+            assert image_output.external_attr == (
+                DOS_ATTRIBUTE_READ_ONLY | DOS_ATTRIBUTE_HIDDEN
+            )
+            assert metadata_output.create_system == ZIP_CREATOR_DOS
+            assert metadata_output.external_attr == DOS_ATTRIBUTE_ARCHIVE
+
+
 class TestOutputVerificationMode:
     def test_supported_modes_have_expected_values(self) -> None:
         assert OutputVerificationMode.NONE == "none"
@@ -2705,6 +2816,46 @@ class TestProcessArchiveFile:
                 + len(unchanged_image)
             ),
         )
+    def test_special_member_failure_preserves_files_and_removes_temporary_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "output.cbz"
+        source_image = create_encoded_image("PNG")
+        special_member = ZipInfo("link")
+        special_member.create_system = ZIP_CREATOR_UNIX
+        special_member.external_attr = (stat.S_IFLNK | 0o777) << 16
+
+        with ZipFile(source_path, mode="w") as archive:
+            archive.writestr("001.png", source_image)
+            archive.writestr(special_member, b"outside")
+
+        source_data = source_path.read_bytes()
+        destination_data = b"existing destination"
+        destination_path.write_bytes(destination_data)
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Unsupported ZIP member type for 'link': symbolic link."
+            ),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() == destination_data
+        assert temporary_archive_paths(destination_path) == []
+
     def test_pixel_limit_failure_preserves_files_and_removes_temporary_output(
         self,
         tmp_path: Path,
