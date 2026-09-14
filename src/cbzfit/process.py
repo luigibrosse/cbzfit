@@ -270,12 +270,7 @@ def transform_archive_contents(
     manifest = build_manifest(
         source_archive,
         max_files=options.max_files,
-        max_file_uncompressed_size=(
-            options.read_limits.max_file_size
-        ),
-        max_total_uncompressed_size=(
-            options.read_limits.max_total_size
-        ),
+        read_limits=options.read_limits,
         path_limits=options.path_limits,
     )
 
