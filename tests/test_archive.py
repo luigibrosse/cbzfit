@@ -20,6 +20,8 @@ import pytest
 
 import cbzfit.archive as archive_module
 from cbzfit.archive import (
+    DEFAULT_EXPANSION_GRACE_SIZE,
+    DEFAULT_MAX_EXPANSION_RATIO,
     DEFAULT_MEMBER_READ_CHUNK_SIZE,
     DEFAULT_UNIX_FILE_PERMISSIONS,
     DOS_ATTRIBUTE_ARCHIVE,
@@ -56,6 +58,7 @@ from cbzfit.archive import (
     read_member_data,
     resolve_member_date_time,
     resolve_output_member_attributes,
+    validate_member_expansion,
     validate_member_path,
     validate_member_type,
     validate_zip_date_time,
@@ -714,6 +717,8 @@ class TestArchiveReadLimits:
 
         assert limits.max_file_size > 0
         assert limits.max_total_size > 0
+        assert limits.max_expansion_ratio == DEFAULT_MAX_EXPANSION_RATIO
+        assert limits.expansion_grace_size == DEFAULT_EXPANSION_GRACE_SIZE
 
     @pytest.mark.parametrize(
         ("arguments", "expected_message"),
@@ -734,6 +739,22 @@ class TestArchiveReadLimits:
                 {"max_total_size": -1},
                 "Maximum total uncompressed size must be a positive integer.",
             ),
+            (
+                {"max_expansion_ratio": 0},
+                "Maximum expansion ratio must be a positive integer.",
+            ),
+            (
+                {"max_expansion_ratio": -1},
+                "Maximum expansion ratio must be a positive integer.",
+            ),
+            (
+                {"expansion_grace_size": 0},
+                "Expansion grace size must be a positive integer.",
+            ),
+            (
+                {"expansion_grace_size": -1},
+                "Expansion grace size must be a positive integer.",
+            ),
         ],
     )
     def test_invalid_limits_are_rejected(
@@ -747,6 +768,38 @@ class TestArchiveReadLimits:
         ):
             ArchiveReadLimits(**arguments)
 
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected_message"),
+        [
+            (
+                {"max_expansion_ratio": True},
+                "Maximum expansion ratio must be an integer.",
+            ),
+            (
+                {"max_expansion_ratio": 1.5},
+                "Maximum expansion ratio must be an integer.",
+            ),
+            (
+                {"expansion_grace_size": False},
+                "Expansion grace size must be an integer.",
+            ),
+            (
+                {"expansion_grace_size": "102400"},
+                "Expansion grace size must be an integer.",
+            ),
+        ],
+    )
+    def test_non_integer_expansion_limits_are_rejected(
+        self,
+        arguments: dict[str, object],
+        expected_message: str,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            ArchiveReadLimits(**arguments)  # type: ignore[arg-type]
 
 class TestArchiveReadState:
     def test_default_state_starts_at_zero(self) -> None:
@@ -1171,6 +1224,136 @@ class TestResolveOutputMemberAttributes:
             ZIP_CREATOR_UNIX,
             (stat.S_IFREG | DEFAULT_UNIX_FILE_PERMISSIONS) << 16,
         )
+
+
+
+class TestValidateMemberExpansion:
+    @staticmethod
+    def create_compressed_member(
+        *,
+        file_size: int,
+        compress_size: int,
+        compression: int = ZIP_DEFLATED,
+        filename: str = "ComicInfo.xml",
+    ) -> ZipInfo:
+        member = ZipInfo(filename)
+        member.compress_type = compression
+        member.file_size = file_size
+        member.compress_size = compress_size
+        return member
+
+    @pytest.mark.parametrize(
+        "file_size",
+        [9_999, 10_000],
+    )
+    def test_expansion_at_or_below_ratio_limit_is_accepted(
+        self,
+        file_size: int,
+    ) -> None:
+        member = self.create_compressed_member(
+            file_size=file_size,
+            compress_size=100,
+        )
+        validate_member_expansion(
+            member,
+            max_expansion_ratio=100,
+            expansion_grace_size=1,
+        )
+
+    def test_expansion_above_ratio_limit_is_rejected(self) -> None:
+        member = self.create_compressed_member(
+            file_size=10_001,
+            compress_size=100,
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member's declared expansion exceeds the permitted "
+                "limit of 100:1 for 'ComicInfo.xml'."
+            ),
+        ):
+            validate_member_expansion(
+                member,
+                max_expansion_ratio=100,
+                expansion_grace_size=1,
+            )
+
+    @pytest.mark.parametrize(
+        "file_size",
+        [99, 100],
+    )
+    def test_expansion_at_or_below_grace_size_is_accepted(
+        self,
+        file_size: int,
+    ) -> None:
+        member = self.create_compressed_member(
+            file_size=file_size,
+            compress_size=1,
+        )
+        validate_member_expansion(
+            member,
+            max_expansion_ratio=10,
+            expansion_grace_size=100,
+        )
+
+    def test_expansion_above_grace_and_ratio_allowance_is_rejected(self) -> None:
+        member = self.create_compressed_member(
+            file_size=101,
+            compress_size=1,
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member's declared expansion exceeds the permitted "
+                "limit of 10:1 for 'ComicInfo.xml'."
+            ),
+        ):
+            validate_member_expansion(
+                member,
+                max_expansion_ratio=10,
+                expansion_grace_size=100,
+            )
+
+    def test_empty_compressed_member_is_accepted(self) -> None:
+        member = self.create_compressed_member(
+            file_size=0,
+            compress_size=0,
+        )
+        validate_member_expansion(
+            member,
+            max_expansion_ratio=100,
+            expansion_grace_size=100,
+        )
+
+    def test_stored_member_is_excluded_from_expansion_validation(self) -> None:
+        member = self.create_compressed_member(
+            file_size=1_000,
+            compress_size=0,
+            compression=ZIP_STORED,
+        )
+        validate_member_expansion(
+            member,
+            max_expansion_ratio=1,
+            expansion_grace_size=1,
+        )
+
+    def test_non_empty_compressed_member_with_zero_size_is_rejected(self) -> None:
+        member = self.create_compressed_member(
+            file_size=1,
+            compress_size=0,
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member declares a non-empty file with zero compressed "
+                "size: 'ComicInfo.xml'."
+            ),
+        ):
+            validate_member_expansion(
+                member,
+                max_expansion_ratio=100,
+                expansion_grace_size=100,
+            )
 
 
 class TestReadMemberData:
@@ -1729,7 +1912,7 @@ class TestBuildManifest:
         ):
             build_manifest(
                 archive,
-                max_file_uncompressed_size=4,
+                read_limits=ArchiveReadLimits(max_file_size=4),
             )
 
     def test_total_uncompressed_size_limit_is_enforced(self) -> None:
@@ -1749,7 +1932,7 @@ class TestBuildManifest:
         ):
             build_manifest(
                 archive,
-                max_total_uncompressed_size=5,
+                read_limits=ArchiveReadLimits(max_total_size=5),
             )
 
     def test_duplicate_normalized_paths_are_rejected(self) -> None:
@@ -1860,27 +2043,10 @@ class TestBuildManifest:
                 path_limits=ArchivePathLimits(max_path_length=10),
             )
 
-    @pytest.mark.parametrize(
-        ("arguments", "expected_message"),
-        [
-            (
-                {"max_files": 0},
-                "Maximum file count must be a positive integer.",
-            ),
-            (
-                {"max_file_uncompressed_size": 0},
-                "Maximum file size must be a positive integer.",
-            ),
-            (
-                {"max_total_uncompressed_size": 0},
-                "Maximum total uncompressed size must be a positive integer.",
-            ),
-        ],
-    )
-    def test_invalid_manifest_limits_are_rejected(
+    @pytest.mark.parametrize("max_files", [0, -1])
+    def test_invalid_file_count_limit_is_rejected(
         self,
-        arguments: dict[str, int],
-        expected_message: str,
+        max_files: int,
     ) -> None:
         archive_stream = create_archive(
             [("001.jpg", b"image")]
@@ -1888,12 +2054,11 @@ class TestBuildManifest:
 
         with ZipFile(archive_stream, mode="r") as archive, pytest.raises(
             ValueError,
-            match=exact_message(expected_message),
+            match=exact_message(
+                "Maximum file count must be a positive integer."
+            ),
         ):
-            build_manifest(
-                archive,
-                **arguments,
-            )
+            build_manifest(archive, max_files=max_files)
 
     @pytest.mark.parametrize(
         ("first", "second"),
@@ -1945,6 +2110,95 @@ class TestBuildManifest:
             member.filename for member in manifest.file_members
         ] == filenames
 
+
+    def test_directory_marker_is_not_checked_for_expansion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_stream = create_archive(
+            [("Chapter 01/", b""), ("Chapter 01/001.jpg", b"image")],
+        )
+        validate_expansion = Mock(wraps=validate_member_expansion)
+        monkeypatch.setattr(
+            archive_module,
+            "validate_member_expansion",
+            validate_expansion,
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            build_manifest(archive)
+
+        assert [
+            call.args[0].filename
+            for call in validate_expansion.call_args_list
+        ] == ["Chapter 01/001.jpg"]
+
+    def test_legitimate_compressed_xml_within_limits_is_accepted(self) -> None:
+        xml = (
+            b"<ComicInfo><Page>ordinary metadata</Page></ComicInfo>" * 2_000
+        )
+        archive_stream = create_archive(
+            [("001.jpg", b"image"), ("ComicInfo.xml", xml)],
+            compression=ZIP_DEFLATED,
+        )
+        with ZipFile(archive_stream, mode="r") as archive:
+            metadata = archive.getinfo("ComicInfo.xml")
+            manifest = build_manifest(
+                archive,
+                read_limits=ArchiveReadLimits(
+                    max_expansion_ratio=400,
+                    expansion_grace_size=100 * 1024,
+                ),
+            )
+        assert metadata in manifest.other_members
+
+    def test_declared_file_size_limit_precedes_expansion_validation(self) -> None:
+        archive_stream = create_archive(
+            [("001.jpg", b"image")],
+            compression=ZIP_DEFLATED,
+        )
+        with ZipFile(archive_stream, mode="r") as archive:
+            member = archive.getinfo("001.jpg")
+            member.file_size = 101
+            member.compress_size = 1
+            with pytest.raises(
+                InvalidArchiveError,
+                match=exact_message(
+                    "Archive member exceeds the permitted size: '001.jpg'."
+                ),
+            ):
+                build_manifest(
+                    archive,
+                    read_limits=ArchiveReadLimits(
+                        max_file_size=100,
+                        max_expansion_ratio=1,
+                        expansion_grace_size=1,
+                    ),
+                )
+
+    def test_declared_total_size_limit_precedes_expansion_validation(self) -> None:
+        archive_stream = create_archive(
+            [("001.jpg", b"image")],
+            compression=ZIP_DEFLATED,
+        )
+        with ZipFile(archive_stream, mode="r") as archive:
+            member = archive.getinfo("001.jpg")
+            member.file_size = 101
+            member.compress_size = 1
+            with pytest.raises(
+                InvalidArchiveError,
+                match=exact_message(
+                    "The archive's uncompressed contents exceed the permitted size."
+                ),
+            ):
+                build_manifest(
+                    archive,
+                    read_limits=ArchiveReadLimits(
+                        max_total_size=100,
+                        max_expansion_ratio=1,
+                        expansion_grace_size=1,
+                    ),
+                )
 
 class TestCurrentZipDateTime:
     def test_current_local_time_uses_zip_precision(
@@ -2414,6 +2668,34 @@ class TestInspectCbz:
             member.filename
             for member in manifest.other_members
         ) == ("ComicInfo.xml",)
+
+    def test_inspect_cbz_applies_custom_read_limits(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "volume.cbz"
+        with ZipFile(
+            archive_path,
+            mode="w",
+            compression=ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("001.jpg", b"image")
+            archive.writestr("ComicInfo.xml", b"A" * 200_000)
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member's declared expansion exceeds the permitted "
+                "limit of 10:1 for 'ComicInfo.xml'."
+            ),
+        ):
+            inspect_cbz(
+                archive_path,
+                read_limits=ArchiveReadLimits(
+                    max_expansion_ratio=10,
+                    expansion_grace_size=1,
+                ),
+            )
 
     def test_inspect_cbz_applies_custom_path_limits(
         self,

@@ -149,6 +149,7 @@ CBZFit rejects:
 - unsupported ZIP compression methods
 - image content that does not match its filename extension
 - archive members or archives that exceed the configured safety limits
+- compressed members whose declared expansion exceeds 100:1 beyond the 100 KiB allowance
 
 ## Development
 

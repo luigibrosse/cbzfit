@@ -26,6 +26,8 @@ SUPPORTED_ZIP_COMPRESSION = frozenset(
 DEFAULT_MAX_ARCHIVE_FILES = 1_000
 DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE = 512 * 1024**2
 DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE = 4 * 1024**3
+DEFAULT_MAX_EXPANSION_RATIO = 100
+DEFAULT_EXPANSION_GRACE_SIZE = 100 * 1024
 DEFAULT_MAX_MEMBER_PATH_LENGTH = 1_024
 DEFAULT_MAX_PATH_COMPONENT_LENGTH = 255
 DEFAULT_MEMBER_READ_CHUNK_SIZE = 64 * 1024
@@ -218,6 +220,8 @@ class ArchiveReadLimits:
 
     max_file_size: int = DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE
     max_total_size: int = DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
+    max_expansion_ratio: int = DEFAULT_MAX_EXPANSION_RATIO
+    expansion_grace_size: int = DEFAULT_EXPANSION_GRACE_SIZE
 
     def __post_init__(self) -> None:
         """Validate archive-member read limits."""
@@ -229,6 +233,32 @@ class ArchiveReadLimits:
         if self.max_total_size <= 0:
             raise ValueError(
                 "Maximum total uncompressed size must be a positive integer."
+            )
+
+        if (
+            isinstance(self.max_expansion_ratio, bool)
+            or not isinstance(self.max_expansion_ratio, int)
+        ):
+            raise TypeError(
+                "Maximum expansion ratio must be an integer."
+            )
+
+        if self.max_expansion_ratio <= 0:
+            raise ValueError(
+                "Maximum expansion ratio must be a positive integer."
+            )
+
+        if (
+            isinstance(self.expansion_grace_size, bool)
+            or not isinstance(self.expansion_grace_size, int)
+        ):
+            raise TypeError(
+                "Expansion grace size must be an integer."
+            )
+
+        if self.expansion_grace_size <= 0:
+            raise ValueError(
+                "Expansion grace size must be a positive integer."
             )
 
 
@@ -473,6 +503,33 @@ def resolve_output_member_attributes(member: ZipInfo) -> tuple[int, int]:
     return ZIP_CREATOR_UNIX, output_mode << 16
 
 
+def validate_member_expansion(
+    member: ZipInfo,
+    *,
+    max_expansion_ratio: int,
+    expansion_grace_size: int,
+) -> None:
+    """Validate declared expansion for one supported compressed file member."""
+    if member.compress_type == ZIP_STORED or member.file_size == 0:
+        return
+
+    if member.compress_size == 0:
+        raise InvalidArchiveError(
+            "Archive member declares a non-empty file with zero compressed "
+            f"size: {member.filename!r}."
+        )
+
+    maximum_permitted_size = max(
+        expansion_grace_size,
+        max_expansion_ratio * member.compress_size,
+    )
+    if member.file_size > maximum_permitted_size:
+        raise InvalidArchiveError(
+            "Archive member's declared expansion exceeds the permitted "
+            f"limit of {max_expansion_ratio}:1 for {member.filename!r}."
+        )
+
+
 def read_member_data(
     archive: ZipFile,
     member: ZipInfo,
@@ -682,15 +739,11 @@ def build_manifest(
     archive: ZipFile,
     *,
     max_files: int = DEFAULT_MAX_ARCHIVE_FILES,
-    max_file_uncompressed_size: int = (
-        DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE
-    ),
-    max_total_uncompressed_size: int = (
-        DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
-    ),
+    read_limits: ArchiveReadLimits | None = None,
     path_limits: ArchivePathLimits | None = None,
 ) -> ArchiveManifest:
     """Validate an open CBZ archive and describe its contents."""
+    member_read_limits = read_limits or ArchiveReadLimits()
     member_path_limits = (
         ArchivePathLimits()
         if path_limits is None
@@ -700,16 +753,6 @@ def build_manifest(
     if max_files <= 0:
         raise ValueError(
             "Maximum file count must be a positive integer."
-        )
-
-    if max_file_uncompressed_size <= 0:
-        raise ValueError(
-            "Maximum file size must be a positive integer."
-        )
-
-    if max_total_uncompressed_size <= 0:
-        raise ValueError(
-            "Maximum total uncompressed size must be a positive integer."
         )
 
     all_members = tuple(archive.infolist())
@@ -765,7 +808,7 @@ def build_manifest(
         for member in file_members_tuple
     )
 
-    if total_uncompressed_size > max_total_uncompressed_size:
+    if total_uncompressed_size > member_read_limits.max_total_size:
         raise InvalidArchiveError(
             "The archive's uncompressed contents exceed the permitted size."
         )
@@ -783,11 +826,16 @@ def build_manifest(
                 f"{member.filename!r}."
             )
 
-        if member.file_size > max_file_uncompressed_size:
+        if member.file_size > member_read_limits.max_file_size:
             raise InvalidArchiveError(
                 f"Archive member exceeds the permitted size: "
                 f"{member.filename!r}."
             )
+        validate_member_expansion(
+            member,
+            max_expansion_ratio=member_read_limits.max_expansion_ratio,
+            expansion_grace_size=member_read_limits.expansion_grace_size,
+        )
 
     image_members: list[ZipInfo] = []
     other_members: list[ZipInfo] = []
@@ -814,12 +862,7 @@ def inspect_cbz(
     archive_path: Path,
     *,
     max_files: int = DEFAULT_MAX_ARCHIVE_FILES,
-    max_file_uncompressed_size: int = (
-        DEFAULT_MAX_FILE_UNCOMPRESSED_SIZE
-    ),
-    max_total_uncompressed_size: int = (
-        DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
-    ),
+    read_limits: ArchiveReadLimits | None = None,
     path_limits: ArchivePathLimits | None = None,
 ) -> ArchiveManifest:
     """Open, validate, and describe a CBZ archive."""
@@ -833,8 +876,7 @@ def inspect_cbz(
             return build_manifest(
                 archive,
                 max_files=max_files,
-                max_file_uncompressed_size=max_file_uncompressed_size,
-                max_total_uncompressed_size=max_total_uncompressed_size,
+                read_limits=read_limits,
                 path_limits=path_limits,
             )
 

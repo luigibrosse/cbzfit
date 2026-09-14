@@ -1140,6 +1140,8 @@ class TestArchiveTransformationOptions:
         read_limits = ArchiveReadLimits(
             max_file_size=100,
             max_total_size=200,
+            max_expansion_ratio=50,
+            expansion_grace_size=75,
         )
         path_limits = ArchivePathLimits(
             max_path_length=100,
@@ -2372,6 +2374,8 @@ class TestTransformArchiveContents:
         read_limits = ArchiveReadLimits(
             max_file_size=100,
             max_total_size=200,
+            max_expansion_ratio=50,
+            expansion_grace_size=75,
         )
         path_limits = ArchivePathLimits(
             max_path_length=100,
@@ -2397,8 +2401,7 @@ class TestTransformArchiveContents:
         build.assert_called_once_with(
             source,
             max_files=5,
-            max_file_uncompressed_size=100,
-            max_total_uncompressed_size=200,
+            read_limits=read_limits,
             path_limits=path_limits,
         )
 
@@ -3525,6 +3528,97 @@ class TestProcessArchiveFile:
         assert temporary_archive_paths(destination_path) == []
         read_member.assert_not_called()
         progress_callback.assert_not_called()
+
+
+    def test_expansion_failure_preserves_files_and_cleans_temporary_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        existing_destination = b"existing destination"
+        with ZipFile(
+            source_path,
+            mode="w",
+            compression=ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("001.png", create_encoded_image("PNG"))
+            archive.writestr("ComicInfo.xml", b"A" * 200_000)
+        source_data = source_path.read_bytes()
+        destination_path.write_bytes(existing_destination)
+        read_member = Mock(
+            side_effect=AssertionError("members must not be read")
+        )
+        progress_callback = Mock()
+        publish = Mock()
+        monkeypatch.setattr(process_module, "read_member_data", read_member)
+        monkeypatch.setattr(process_module, "_publish_archive", publish)
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member's declared expansion exceeds the permitted "
+                "limit of 100:1 for 'ComicInfo.xml'."
+            ),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+                progress_callback=progress_callback,
+            )
+
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() == existing_destination
+        assert temporary_archive_paths(destination_path) == []
+        read_member.assert_not_called()
+        progress_callback.assert_not_called()
+        publish.assert_not_called()
+
+    def test_actual_read_limits_remain_active_with_permissive_expansion_limits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        create_archive_file(
+            source_path,
+            [("001.png", create_encoded_image("PNG"))],
+        )
+        error = InvalidArchiveError(
+            "Archive member exceeds the permitted size while reading: '001.png'."
+        )
+        read_member = Mock(side_effect=error)
+        monkeypatch.setattr(process_module, "read_member_data", read_member)
+
+        with pytest.raises(InvalidArchiveError) as exception_info:
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                    read_limits=ArchiveReadLimits(
+                        max_file_size=1_000_000,
+                        max_total_size=1_000_000,
+                        max_expansion_ratio=1_000_000,
+                        expansion_grace_size=1_000_000,
+                    ),
+                ),
+            )
+
+        assert exception_info.value is error
+        read_member.assert_called_once()
+        assert not destination_path.exists()
+        assert temporary_archive_paths(destination_path) == []
 
     def test_missing_source_file_is_rejected(
         self,
