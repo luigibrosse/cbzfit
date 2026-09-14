@@ -51,6 +51,8 @@ from cbzfit.archive import (
     current_zip_date_time,
     has_supported_image_extension,
     inspect_cbz,
+    is_directory_marker,
+    portable_member_path_key,
     read_member_data,
     resolve_member_date_time,
     resolve_output_member_attributes,
@@ -146,7 +148,6 @@ class FailingStream:
 
 
 class TestHasSupportedImageExtension:
-
     @pytest.mark.parametrize(
         "filename",
         [
@@ -162,7 +163,6 @@ class TestHasSupportedImageExtension:
         filename: str,
     ) -> None:
         assert has_supported_image_extension(filename)
-
 
     @pytest.mark.parametrize(
         "filename",
@@ -182,7 +182,6 @@ class TestHasSupportedImageExtension:
         assert not has_supported_image_extension(filename)
 
 class TestContainsControlCharacters:
-
     @pytest.mark.parametrize(
         "value",
         [
@@ -197,7 +196,6 @@ class TestContainsControlCharacters:
         value: str,
     ) -> None:
         assert contains_control_characters(value)
-
 
     @pytest.mark.parametrize(
         "value",
@@ -446,8 +444,26 @@ class TestArchivePathLimits:
             ArchivePathLimits(**arguments)
 
 
-class TestValidateMemberPath:
+class TestIsDirectoryMarker:
+    @pytest.mark.parametrize(
+        "filename",
+        ["Chapter 01/", "Chapter 01\\"],
+    )
+    def test_directory_marker_is_detected(self, filename: str) -> None:
+        assert is_directory_marker(filename)
 
+    @pytest.mark.parametrize(
+        "filename",
+        ["Chapter 01", "Chapter 01/001.jpg", "Chapter 01\\001.jpg"],
+    )
+    def test_regular_file_is_not_a_directory_marker(
+        self,
+        filename: str,
+    ) -> None:
+        assert not is_directory_marker(filename)
+
+
+class TestValidateMemberPath:
     def test_member_path_is_normalized(self) -> None:
         result = validate_member_path(r"Chapter 01\001.jpg")
 
@@ -480,7 +496,6 @@ class TestValidateMemberPath:
         ):
             validate_member_path(filename)
 
-
     def test_empty_member_path_is_rejected(self) -> None:
         expected_message = "Archive members must have a non-empty path."
 
@@ -489,7 +504,6 @@ class TestValidateMemberPath:
             match=exact_message(expected_message),
         ):
             validate_member_path("")
-
 
     def test_member_path_with_control_characters_is_rejected(self) -> None:
         filename = "chapter\n01/001.jpg"
@@ -502,7 +516,6 @@ class TestValidateMemberPath:
             match=exact_message(expected_message),
         ):
             validate_member_path(filename)
-
 
     def test_overlong_path_component_is_rejected(self) -> None:
         filename = f"{'a' * 10}.jpg"
@@ -522,7 +535,6 @@ class TestValidateMemberPath:
                 ),
             )
 
-
     def test_overlong_complete_path_is_rejected(self) -> None:
         filename = "chapter/001.jpg"
         expected_message = (
@@ -540,7 +552,160 @@ class TestValidateMemberPath:
                 ),
             )
 
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "001.jpg ",
+            "001.jpg.",
+            "Chapter /001.jpg",
+            "Chapter./001.jpg",
+        ],
+    )
+    def test_trailing_space_or_dot_is_rejected(
+        self,
+        filename: str,
+    ) -> None:
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member path component ends in a space or dot: "
+                f"{filename!r}."
+            ),
+        ):
+            validate_member_path(filename)
 
+    @pytest.mark.parametrize(
+        "invalid_character",
+        ["<", ">", '"', "|", "?", "*", ":"],
+    )
+    @pytest.mark.parametrize(
+        "filename_template",
+        [
+            "Chapter 01/page{character}01.jpg",
+            "Chapter{character}01/001.jpg",
+        ],
+        ids=[
+            "final-component",
+            "parent-component",
+        ],
+    )
+    def test_windows_invalid_filename_character_is_rejected(
+        self,
+        invalid_character: str,
+        filename_template: str,
+    ) -> None:
+        filename = filename_template.format(
+            character=invalid_character,
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member path contains an invalid Windows filename "
+                f"character: {filename!r}."
+            ),
+        ):
+            validate_member_path(filename)
+
+
+    def test_windows_alternate_data_stream_is_rejected(
+        self,
+    ) -> None:
+        filename = "001.jpg:payload"
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member path contains an invalid Windows filename "
+                f"character: {filename!r}."
+            ),
+        ):
+            validate_member_path(filename)
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "Chapter 01//001.jpg",
+            "Chapter 01\\/001.jpg",
+            "Chapter 01/\\001.jpg",
+            "Chapter 01//",
+            "Chapter 01\\\\",
+        ],
+    )
+    def test_repeated_separator_is_rejected(self, filename: str) -> None:
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                f"Archive member path contains an empty component: {filename!r}."
+            ),
+        ):
+            validate_member_path(filename)
+
+    @pytest.mark.parametrize(
+        "device_name",
+        [
+            "CON",
+            "prn",
+            "AuX.txt",
+            "nul.metadata.xml",
+            "COM1.jpg",
+            "com9",
+            "LPT1.png",
+            "lpt9.backup",
+            "COM¹",
+            "com².jpg",
+            "LPT³.metadata.xml",
+        ],
+    )
+    def test_windows_reserved_name_is_rejected(
+        self,
+        device_name: str,
+    ) -> None:
+        filename = f"Chapter 01/{device_name}"
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                f"Archive member uses a reserved Windows name: {filename!r}."
+            ),
+        ):
+            validate_member_path(filename)
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "CON/001.jpg",
+            "Chapter 01/COM1/001.jpg",
+            "Chapter 01/COM¹/001.jpg",
+        ],
+    )
+    def test_windows_reserved_parent_component_is_rejected(
+        self,
+        filename: str,
+    ) -> None:
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                f"Archive member uses a reserved Windows name: {filename!r}."
+            ),
+        ):
+            validate_member_path(filename)
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "console.jpg",
+            "auxiliary.png",
+            "com10.jpg",
+            "lpt10.txt",
+            "COM⁴.jpg",
+            "LPT¹0.jpg",
+            "COM¹page.jpg",
+            "進撃の巨人/第01話.png",
+            "Chapter 01/page.v2.final.jpg",
+        ],
+    )
+    def test_portable_path_is_preserved(self, filename: str) -> None:
+        assert validate_member_path(filename) == filename
 
 
 class TestArchiveReadLimits:
@@ -602,6 +767,29 @@ class TestArchiveReadState:
             match=exact_message(expected_message),
         ):
             ArchiveReadState(total_size=-1)
+
+
+class TestPortableMemberPathKey:
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("Chapter/Page.JPG", "chapter/page.jpg"),
+            ("Café/001.jpg", "Cafe\u0301/001.jpg"),
+        ],
+    )
+    def test_portable_equivalents_share_a_key(
+        self,
+        first: str,
+        second: str,
+    ) -> None:
+        assert portable_member_path_key(first) == portable_member_path_key(
+            second
+        )
+
+    def test_distinct_paths_have_distinct_keys(self) -> None:
+        assert portable_member_path_key(
+            "Chapter 01/001.jpg"
+        ) != portable_member_path_key("Chapter 02/001.jpg")
 
 
 class TestValidateMemberType:
@@ -831,6 +1019,47 @@ class TestValidateMemberType:
         )
 
         assert validate_member_type(member) is None
+
+
+class TestBackslashDirectoryMarkers:
+    @pytest.mark.parametrize(
+        ("create_system", "external_attr"),
+        [
+            (ZIP_CREATOR_UNIX, (stat.S_IFDIR | 0o755) << 16),
+            (ZIP_CREATOR_DOS, DOS_ATTRIBUTE_DIRECTORY),
+        ],
+    )
+    def test_backslash_directory_marker_is_accepted(
+        self,
+        create_system: int,
+        external_attr: int,
+    ) -> None:
+        member = create_member(
+            "Chapter 01\\",
+            create_system=create_system,
+            external_attr=external_attr,
+        )
+        normalized_path = validate_member_path(member.filename)
+
+        assert normalized_path == "Chapter 01"
+        assert is_directory_marker(member.filename)
+        assert validate_member_type(member) is None
+
+    def test_backslash_directory_marker_is_omitted_from_manifest(self) -> None:
+        archive_stream = create_archive(
+            [("temporary/", b""), ("001.jpg", b"image")],
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            directory = archive.infolist()[0]
+            directory.filename = "Chapter 01\\"
+            directory.create_system = ZIP_CREATOR_DOS
+            directory.external_attr = DOS_ATTRIBUTE_DIRECTORY
+            manifest = build_manifest(archive)
+
+        assert [
+            member.filename for member in manifest.file_members
+        ] == ["001.jpg"]
 
 
 class TestResolveOutputMemberAttributes:
@@ -1293,8 +1522,8 @@ class TestReadMemberData:
         assert state.total_size == 0
         assert member_stream.closed is True
 
-class TestBuildManifest:
 
+class TestBuildManifest:
     def test_manifest_classifies_members_and_preserves_order(self) -> None:
         archive_stream = create_archive(
             [
@@ -1343,7 +1572,6 @@ class TestBuildManifest:
             + len(b"notes")
         )
 
-
     @pytest.mark.parametrize(
         "compression",
         [
@@ -1365,7 +1593,6 @@ class TestBuildManifest:
 
         assert manifest.image_count == 1
 
-
     def test_directory_entries_are_excluded_from_manifest(self) -> None:
         archive_stream = create_archive(
             [
@@ -1381,7 +1608,6 @@ class TestBuildManifest:
             member.filename
             for member in manifest.file_members
         ) == ("Chapter 01/001.jpg",)
-
 
     @pytest.mark.parametrize(
         ("file_type", "type_name"),
@@ -1442,7 +1668,6 @@ class TestBuildManifest:
         ):
             build_manifest(archive)
 
-
     def test_directory_only_archive_is_rejected(self) -> None:
         archive_stream = create_archive(
             [("Chapter 01/", b"")]
@@ -1454,7 +1679,6 @@ class TestBuildManifest:
             match=exact_message(expected_message),
         ):
             build_manifest(archive)
-
 
     def test_archive_without_supported_images_is_rejected(self) -> None:
         archive_stream = create_archive(
@@ -1472,7 +1696,6 @@ class TestBuildManifest:
             match=exact_message(expected_message),
         ):
             build_manifest(archive)
-
 
     def test_archive_file_count_limit_is_enforced(self) -> None:
         archive_stream = create_archive(
@@ -1492,7 +1715,6 @@ class TestBuildManifest:
                 max_files=1,
             )
 
-
     def test_per_file_size_limit_is_enforced(self) -> None:
         archive_stream = create_archive(
             [("001.jpg", b"12345")]
@@ -1509,7 +1731,6 @@ class TestBuildManifest:
                 archive,
                 max_file_uncompressed_size=4,
             )
-
 
     def test_total_uncompressed_size_limit_is_enforced(self) -> None:
         archive_stream = create_archive(
@@ -1530,7 +1751,6 @@ class TestBuildManifest:
                 archive,
                 max_total_uncompressed_size=5,
             )
-
 
     def test_duplicate_normalized_paths_are_rejected(self) -> None:
         duplicate_filename = r"Chapter\001.jpg"
@@ -1554,7 +1774,6 @@ class TestBuildManifest:
             ):
                 build_manifest(archive)
 
-
     def test_encrypted_member_is_rejected(self) -> None:
         archive_stream = create_archive(
             [("001.jpg", b"image")]
@@ -1571,7 +1790,6 @@ class TestBuildManifest:
                 match=exact_message(expected_message),
             ):
                 build_manifest(archive)
-
 
     def test_dos_filesystem_encryption_does_not_imply_zip_encryption(
         self,
@@ -1626,7 +1844,6 @@ class TestBuildManifest:
             ):
                 build_manifest(archive)
 
-
     def test_custom_path_limits_are_applied(self) -> None:
         filename = "Chapter 01/001.jpg"
         archive_stream = create_archive([(filename, b"image")])
@@ -1677,6 +1894,57 @@ class TestBuildManifest:
                 archive,
                 **arguments,
             )
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("Page.jpg", "page.jpg"),
+            ("Chapter/Page.jpg", "chapter/page.jpg"),
+            ("Café/001.jpg", "Cafe\u0301/001.jpg"),
+            ("Chapter/", "chapter/"),
+            ("Chapter", "chapter/"),
+        ],
+    )
+    def test_portable_path_collision_is_rejected(
+        self,
+        first: str,
+        second: str,
+    ) -> None:
+        archive_stream = create_archive(
+            [
+                (first, b"first"),
+                (second, b"second"),
+                ("cover.jpg", b"image"),
+            ]
+        )
+        expected_message = (
+            "The archive contains paths that collide across filesystems: "
+            f"{first!r} and {second!r}."
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive, pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            build_manifest(archive)
+
+    def test_valid_unicode_casing_and_order_are_preserved(self) -> None:
+        filenames = [
+            "進撃の巨人/第01話.PNG",
+            "Chapter 01/page.v2.final.jpg",
+            "ComicInfo.xml",
+        ]
+        archive_stream = create_archive(
+            [(filename, b"data") for filename in filenames]
+        )
+
+        with ZipFile(archive_stream, mode="r") as archive:
+            manifest = build_manifest(archive)
+
+        assert [
+            member.filename for member in manifest.file_members
+        ] == filenames
+
 
 class TestCurrentZipDateTime:
     def test_current_local_time_uses_zip_precision(
@@ -2120,7 +2388,6 @@ class TestWriteMemberData:
 
 
 class TestInspectCbz:
-
     def test_inspect_cbz_returns_manifest(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "volume.cbz"
 
@@ -2147,7 +2414,6 @@ class TestInspectCbz:
             member.filename
             for member in manifest.other_members
         ) == ("ComicInfo.xml",)
-
 
     def test_inspect_cbz_applies_custom_path_limits(
         self,
@@ -2181,7 +2447,6 @@ class TestInspectCbz:
             match=exact_message(expected_message),
         ):
             inspect_cbz(archive_path)
-
 
     def test_inspect_cbz_rejects_invalid_zip(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "invalid.cbz"

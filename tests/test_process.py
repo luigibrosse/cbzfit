@@ -155,7 +155,6 @@ def temporary_archive_paths(destination_path: Path) -> list[Path]:
 
 
 class TestImageProcessingOptions:
-
     def test_required_screen_size_is_retained(self) -> None:
         options = ImageProcessingOptions(
             portrait_screen_size=(1404, 1872),
@@ -239,7 +238,6 @@ class TestImageProcessingOptions:
             first_options.encoder_options
             is not second_options.encoder_options
         )
-
 
     @pytest.mark.parametrize(
         "screen_size",
@@ -1481,7 +1479,6 @@ class TestArchiveProgressReporting:
         assert not destination_path.exists()
         assert temporary_archive_paths(destination_path) == []
 
-
     def test_output_members_use_safe_regular_file_metadata(self) -> None:
         source_stream = BytesIO()
         destination_stream = BytesIO()
@@ -1531,7 +1528,6 @@ class TestArchiveProgressReporting:
         assert image_output.external_attr >> 16 == stat.S_IFREG | 0o640
         assert metadata_output.create_system == ZIP_CREATOR_UNIX
         assert metadata_output.external_attr >> 16 == stat.S_IFREG | 0o644
-
 
     def test_dos_metadata_is_sanitized_through_transformation(self) -> None:
         source_stream = BytesIO()
@@ -3357,6 +3353,179 @@ class TestProcessArchiveFile:
         publish.assert_not_called()
         assert not destination_path.exists()
         assert temporary_archive_paths(destination_path) == []
+
+    def test_backslash_path_is_normalized_in_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        source_filename = "Chapter 01\\001.PNG"
+        output_filename = "Chapter 01/001.PNG"
+        create_archive_file(
+            source_path,
+            [
+                (
+                    source_filename,
+                    create_encoded_image("PNG", size=(20, 40)),
+                ),
+            ],
+        )
+
+        process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+
+        with ZipFile(destination_path, mode="r") as archive:
+            assert archive.namelist() == [output_filename]
+
+    def test_decomposed_unicode_path_is_preserved_in_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        filename = "Cafe\u0301/第01話.PNG"
+        create_archive_file(
+            source_path,
+            [
+                (
+                    filename,
+                    create_encoded_image("PNG", size=(20, 40)),
+                ),
+            ],
+        )
+
+        process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+
+        with ZipFile(destination_path, mode="r") as archive:
+            assert archive.namelist() == [filename]
+
+    @pytest.mark.parametrize(
+        ("invalid_filename", "expected_message"),
+        [
+            (
+                "Chapter 01//001.jpg",
+                (
+                    "Archive member path contains an empty component: "
+                    "'Chapter 01//001.jpg'."
+                ),
+            ),
+            (
+                "Chapter 01/page?.jpg",
+                (
+                    "Archive member path contains an invalid Windows "
+                    "filename character: 'Chapter 01/page?.jpg'."
+                ),
+            ),
+        ],
+    )
+    def test_non_portable_path_failure_preserves_files_and_cleans_temporary_output(
+        self,
+        invalid_filename: str,
+        expected_message: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        existing_destination = b"existing destination"
+        create_archive_file(
+            source_path,
+            [(invalid_filename, create_encoded_image("JPEG"))],
+        )
+        source_data = source_path.read_bytes()
+        destination_path.write_bytes(existing_destination)
+        read_member = Mock(
+            side_effect=AssertionError("members must not be read")
+        )
+        progress_callback = Mock()
+        monkeypatch.setattr(process_module, "read_member_data", read_member)
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+                progress_callback=progress_callback,
+            )
+
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() == existing_destination
+        assert temporary_archive_paths(destination_path) == []
+        read_member.assert_not_called()
+        progress_callback.assert_not_called()
+
+    def test_portable_path_collision_fails_before_member_reading(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        existing_destination = b"existing destination"
+        create_archive_file(
+            source_path,
+            [
+                ("Page.jpg", create_encoded_image("JPEG")),
+                ("page.jpg", create_encoded_image("JPEG")),
+            ],
+        )
+        source_data = source_path.read_bytes()
+        destination_path.write_bytes(existing_destination)
+        read_member = Mock(
+            side_effect=AssertionError("members must not be read")
+        )
+        progress_callback = Mock()
+        monkeypatch.setattr(process_module, "read_member_data", read_member)
+        expected_message = (
+            "The archive contains paths that collide across filesystems: "
+            "'Page.jpg' and 'page.jpg'."
+        )
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(expected_message),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+                progress_callback=progress_callback,
+            )
+
+        assert source_path.read_bytes() == source_data
+        assert destination_path.read_bytes() == existing_destination
+        assert temporary_archive_paths(destination_path) == []
+        read_member.assert_not_called()
+        progress_callback.assert_not_called()
+
     def test_missing_source_file_is_rejected(
         self,
         tmp_path: Path,

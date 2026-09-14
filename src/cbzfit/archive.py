@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from unicodedata import category
+from unicodedata import category, normalize
 from zipfile import (
     ZIP_DEFLATED,
     ZIP_STORED,
@@ -61,6 +61,24 @@ DOS_REJECTED_ATTRIBUTES = (
     DOS_ATTRIBUTE_VOLUME_LABEL
     | DOS_ATTRIBUTE_DEVICE
     | DOS_ATTRIBUTE_REPARSE_POINT
+)
+
+WINDOWS_INVALID_FILENAME_CHARACTERS = frozenset('<>"|?*:')
+WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "aux",
+        "con",
+        "nul",
+        "prn",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
+    }
 )
 
 ZipDateTime = tuple[int, int, int, int, int, int]
@@ -247,6 +265,11 @@ def contains_control_characters(value: str) -> bool:
     )
 
 
+def is_directory_marker(filename: str) -> bool:
+    """Return whether a ZIP member path denotes a directory marker."""
+    return filename.replace("\\", "/").endswith("/")
+
+
 def validate_member_path(
     filename: str,
     *,
@@ -254,9 +277,9 @@ def validate_member_path(
 ) -> str:
     """Validate and return a normalized archive member path.
 
-    A member path must not be empty, absolute, drive-qualified, use a network
-    share, contain control characters, contain an overlong path component, or
-    contain a parent-directory component ("..").
+    A member path must be safe for portable extraction and must not contain
+    traversal, reserved device names, alternate-stream syntax, or components
+    that portable filesystems normalize ambiguously.
     """
     path_limits = limits or ArchivePathLimits()
 
@@ -283,6 +306,47 @@ def validate_member_path(
             f"Archive member has an unsafe path: {filename!r}."
         )
 
+    path_components = normalized_filename.split("/")
+    if is_directory_marker(normalized_filename):
+        path_components.pop()
+
+    has_empty_component = any(
+        not component
+        for component in path_components
+    )
+
+    if has_empty_component:
+        raise InvalidArchiveError(
+            f"Archive member path contains an empty component: {filename!r}."
+        )
+
+    if any(
+        component.endswith((" ", "."))
+        for component in path_components
+    ):
+        raise InvalidArchiveError(
+            "Archive member path component ends in a space or dot: "
+            f"{filename!r}."
+        )
+
+    if any(
+        WINDOWS_INVALID_FILENAME_CHARACTERS.intersection(component)
+        for component in path_components
+    ):
+        raise InvalidArchiveError(
+            "Archive member path contains an invalid Windows filename "
+            f"character: {filename!r}."
+        )
+
+    if any(
+        normalize("NFC", component).split(".", 1)[0].casefold()
+        in WINDOWS_RESERVED_DEVICE_NAMES
+        for component in path_components
+    ):
+        raise InvalidArchiveError(
+            f"Archive member uses a reserved Windows name: {filename!r}."
+        )
+
     if any(
         len(component) > path_limits.max_component_length
         for component in posix_path.parts
@@ -304,9 +368,14 @@ def validate_member_path(
     return normalized_path
 
 
+def portable_member_path_key(normalized_path: str) -> str:
+    """Return a cross-platform comparison key for a validated member path."""
+    return normalize("NFC", normalized_path).casefold()
+
+
 def validate_member_type(member: ZipInfo) -> None:
     """Validate that a ZIP member is a regular file or directory marker."""
-    is_directory_path = member.filename.endswith("/")
+    is_directory = is_directory_marker(member.filename)
 
     if member.create_system == ZIP_CREATOR_UNIX:
         unix_mode = member.external_attr >> 16
@@ -316,7 +385,7 @@ def validate_member_type(member: ZipInfo) -> None:
             return
 
         if stat.S_ISREG(unix_mode):
-            if is_directory_path:
+            if is_directory:
                 raise InvalidArchiveError(
                     "ZIP member type conflicts with its path: "
                     f"{member.filename!r}."
@@ -324,7 +393,7 @@ def validate_member_type(member: ZipInfo) -> None:
             return
 
         if stat.S_ISDIR(unix_mode):
-            if not is_directory_path:
+            if not is_directory:
                 raise InvalidArchiveError(
                     "ZIP member type conflicts with its path: "
                     f"{member.filename!r}."
@@ -369,7 +438,7 @@ def validate_member_type(member: ZipInfo) -> None:
         has_directory_attribute = bool(
             dos_attributes & DOS_ATTRIBUTE_DIRECTORY
         )
-        if has_directory_attribute != is_directory_path:
+        if has_directory_attribute != is_directory:
             raise InvalidArchiveError(
                 "ZIP member type conflicts with its path: "
                 f"{member.filename!r}."
@@ -646,6 +715,7 @@ def build_manifest(
     all_members = tuple(archive.infolist())
     file_members: list[ZipInfo] = []
     seen_paths: set[str] = set()
+    seen_portable_paths: dict[str, str] = {}
 
     for member in all_members:
         normalized_path = validate_member_path(
@@ -661,9 +731,19 @@ def build_manifest(
 
         seen_paths.add(normalized_path)
 
+        portable_path = portable_member_path_key(normalized_path)
+        conflicting_path = seen_portable_paths.get(portable_path)
+        if conflicting_path is not None:
+            raise InvalidArchiveError(
+                "The archive contains paths that collide across filesystems: "
+                f"{conflicting_path!r} and {member.filename!r}."
+            )
+
+        seen_portable_paths[portable_path] = member.filename
+
         validate_member_type(member)
 
-        if member.filename.endswith("/"):
+        if is_directory_marker(member.filename):
             continue
 
         file_members.append(member)
