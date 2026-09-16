@@ -173,7 +173,14 @@ def encode_image(
     normalized_format = normalize_image_format(
         output_format,
     )
-    encoder_options = options or EncoderOptions()
+    if options is None:
+        encoder_options = EncoderOptions()
+    elif not isinstance(options, EncoderOptions):
+        raise TypeError(
+            "Encoder options must be an EncoderOptions instance."
+        )
+    else:
+        encoder_options = options
     output = BytesIO()
 
     if normalized_format == "JPEG":

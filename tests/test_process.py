@@ -226,6 +226,25 @@ class TestImageProcessingOptions:
                 max_image_pixels=max_image_pixels,
             )
 
+    @pytest.mark.parametrize(
+        "encoder_options",
+        [False, {}, "", object()],
+    )
+    def test_invalid_encoder_options_object_is_rejected(
+        self,
+        encoder_options: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Encoder options must be an EncoderOptions instance."
+            ),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                encoder_options=encoder_options,  # type: ignore[arg-type]
+            )
+
     def test_default_encoder_options_are_not_shared(self) -> None:
         first_options = ImageProcessingOptions(
             portrait_screen_size=(1404, 1872),
@@ -1178,6 +1197,72 @@ class TestArchiveTransformationOptions:
                     portrait_screen_size=(1404, 1872),
                 ),
                 max_files=max_files,
+            )
+
+
+    @pytest.mark.parametrize(
+        "max_files",
+        [True, False, 1.5, "100", None, object()],
+    )
+    def test_non_integer_max_files_is_rejected(
+        self,
+        max_files: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Maximum file count must be an integer."
+            ),
+        ):
+            ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(1404, 1872),
+                ),
+                max_files=max_files,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected_message"),
+        [
+            (
+                {"image_options": False},
+                "Image options must be an ImageProcessingOptions instance.",
+            ),
+            (
+                {"read_limits": {}},
+                "Archive read limits must be an ArchiveReadLimits instance.",
+            ),
+            (
+                {"path_limits": ""},
+                "Archive path limits must be an ArchivePathLimits instance.",
+            ),
+            (
+                {"date_time_policy": object()},
+                (
+                    "Member date-time policy must be a "
+                    "MemberDateTimePolicy instance."
+                ),
+            ),
+        ],
+    )
+    def test_invalid_nested_policy_object_is_rejected(
+        self,
+        arguments: dict[str, object],
+        expected_message: str,
+    ) -> None:
+        valid_arguments: dict[str, object] = {
+            "image_options": ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+            )
+        }
+        valid_arguments.update(arguments)
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            ArchiveTransformationOptions(
+                **valid_arguments,  # type: ignore[arg-type]
             )
 
 

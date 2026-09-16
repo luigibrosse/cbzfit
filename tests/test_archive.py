@@ -61,6 +61,7 @@ from cbzfit.archive import (
     validate_member_expansion,
     validate_member_path,
     validate_member_type,
+    validate_positive_integer,
     validate_zip_date_time,
     write_member_data,
 )
@@ -407,6 +408,41 @@ class TestMemberDateTimePolicy:
             )
 
 
+class TestValidatePositiveInteger:
+    @pytest.mark.parametrize("value", [1, 100])
+    def test_positive_integer_is_returned(self, value: int) -> None:
+        assert validate_positive_integer(
+            value,
+            name="Maximum test value",
+        ) == value
+
+    @pytest.mark.parametrize("value", [True, 1.5, "1", None, object()])
+    def test_non_integer_is_rejected(self, value: object) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Maximum test value must be an integer."
+            ),
+        ):
+            validate_positive_integer(
+                value,
+                name="Maximum test value",
+            )
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_non_positive_integer_is_rejected(self, value: int) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Maximum test value must be a positive integer."
+            ),
+        ):
+            validate_positive_integer(
+                value,
+                name="Maximum test value",
+            )
+
+
 class TestArchivePathLimits:
     def test_default_path_limits_are_created(self) -> None:
         limits = ArchivePathLimits()
@@ -445,6 +481,39 @@ class TestArchivePathLimits:
             match=exact_message(expected_message),
         ):
             ArchivePathLimits(**arguments)
+
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected_message"),
+        [
+            (
+                {"max_path_length": True},
+                "Maximum member path length must be an integer.",
+            ),
+            (
+                {"max_path_length": 1.5},
+                "Maximum member path length must be an integer.",
+            ),
+            (
+                {"max_component_length": "255"},
+                "Maximum path component length must be an integer.",
+            ),
+            (
+                {"max_component_length": None},
+                "Maximum path component length must be an integer.",
+            ),
+        ],
+    )
+    def test_non_integer_path_limits_are_rejected(
+        self,
+        arguments: dict[str, object],
+        expected_message: str,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            ArchivePathLimits(**arguments)  # type: ignore[arg-type]
 
 
 class TestIsDirectoryMarker:
@@ -693,6 +762,22 @@ class TestValidateMemberPath:
         ):
             validate_member_path(filename)
 
+    @pytest.mark.parametrize("limits", [False, {}, object()])
+    def test_invalid_path_limits_object_is_rejected(
+        self,
+        limits: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Archive path limits must be an ArchivePathLimits instance."
+            ),
+        ):
+            validate_member_path(
+                "001.jpg",
+                limits=limits,  # type: ignore[arg-type]
+            )
+
     @pytest.mark.parametrize(
         "filename",
         [
@@ -801,6 +886,48 @@ class TestArchiveReadLimits:
         ):
             ArchiveReadLimits(**arguments)  # type: ignore[arg-type]
 
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected_message"),
+        [
+            (
+                {"max_file_size": True},
+                "Maximum file size must be an integer.",
+            ),
+            (
+                {"max_file_size": 1.5},
+                "Maximum file size must be an integer.",
+            ),
+            (
+                {"max_total_size": "1024"},
+                "Maximum total uncompressed size must be an integer.",
+            ),
+            (
+                {"max_total_size": None},
+                "Maximum total uncompressed size must be an integer.",
+            ),
+            (
+                {"max_expansion_ratio": object()},
+                "Maximum expansion ratio must be an integer.",
+            ),
+            (
+                {"expansion_grace_size": object()},
+                "Expansion grace size must be an integer.",
+            ),
+        ],
+    )
+    def test_non_integer_read_limits_are_rejected(
+        self,
+        arguments: dict[str, object],
+        expected_message: str,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            ArchiveReadLimits(**arguments)  # type: ignore[arg-type]
+
+
 class TestArchiveReadState:
     def test_default_state_starts_at_zero(self) -> None:
         state = ArchiveReadState()
@@ -823,6 +950,69 @@ class TestArchiveReadState:
 
 
 class TestPortableMemberPathKey:
+    @pytest.mark.parametrize(
+        "max_files",
+        [True, 1.5, "100", None, object()],
+    )
+    def test_non_integer_file_count_limit_is_rejected(
+        self,
+        max_files: object,
+    ) -> None:
+        archive_stream = create_archive([("001.jpg", b"image")])
+
+        with ZipFile(archive_stream, mode="r") as archive, pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Maximum file count must be an integer."
+            ),
+        ):
+            build_manifest(
+                archive,
+                max_files=max_files,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        ("argument", "value", "expected_message"),
+        [
+            (
+                "read_limits",
+                {},
+                "Archive read limits must be an ArchiveReadLimits instance.",
+            ),
+            (
+                "read_limits",
+                False,
+                "Archive read limits must be an ArchiveReadLimits instance.",
+            ),
+            (
+                "path_limits",
+                {},
+                "Archive path limits must be an ArchivePathLimits instance.",
+            ),
+            (
+                "path_limits",
+                False,
+                "Archive path limits must be an ArchivePathLimits instance.",
+            ),
+        ],
+    )
+    def test_invalid_policy_object_is_rejected(
+        self,
+        argument: str,
+        value: object,
+        expected_message: str,
+    ) -> None:
+        archive_stream = create_archive([("001.jpg", b"image")])
+
+        with ZipFile(archive_stream, mode="r") as archive, pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            build_manifest(
+                archive,
+                **{argument: value},  # type: ignore[arg-type]
+            )
+
     @pytest.mark.parametrize(
         ("first", "second"),
         [
@@ -2716,6 +2906,41 @@ class TestInspectCbz:
             inspect_cbz(
                 archive_path,
                 path_limits=ArchivePathLimits(max_path_length=10),
+            )
+
+    @pytest.mark.parametrize(
+        ("argument", "value", "expected_message"),
+        [
+            (
+                "read_limits",
+                False,
+                "Archive read limits must be an ArchiveReadLimits instance.",
+            ),
+            (
+                "path_limits",
+                {},
+                "Archive path limits must be an ArchivePathLimits instance.",
+            ),
+        ],
+    )
+    def test_inspect_cbz_rejects_invalid_policy_object(
+        self,
+        argument: str,
+        value: object,
+        expected_message: str,
+        tmp_path: Path,
+    ) -> None:
+        archive_path = tmp_path / "volume.cbz"
+        with ZipFile(archive_path, mode="w") as archive:
+            archive.writestr("001.jpg", b"image")
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(expected_message),
+        ):
+            inspect_cbz(
+                archive_path,
+                **{argument: value},  # type: ignore[arg-type]
             )
 
     def test_inspect_cbz_rejects_missing_file(self, tmp_path: Path) -> None:

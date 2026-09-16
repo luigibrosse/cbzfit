@@ -29,6 +29,7 @@ from cbzfit.archive import (
     MemberDateTimePolicy,
     build_manifest,
     read_member_data,
+    validate_positive_integer,
     write_member_data,
 )
 from cbzfit.decode import (
@@ -71,22 +72,18 @@ class ImageProcessingOptions:
 
     def __post_init__(self) -> None:
         """Validate image-processing settings."""
+        if not isinstance(self.encoder_options, EncoderOptions):
+            raise TypeError(
+                "Encoder options must be an EncoderOptions instance."
+            )
+
         validate_portrait_screen_size(
             self.portrait_screen_size
         )
-
-        if (
-            isinstance(self.max_image_pixels, bool)
-            or not isinstance(self.max_image_pixels, int)
-        ):
-            raise TypeError(
-                "Maximum image pixel count must be an integer."
-            )
-
-        if self.max_image_pixels <= 0:
-            raise ValueError(
-                "Maximum image pixel count must be a positive integer."
-            )
+        validate_positive_integer(
+            self.max_image_pixels,
+            name="Maximum image pixel count",
+        )
 
 
 @dataclass(frozen=True)
@@ -121,10 +118,28 @@ class ArchiveTransformationOptions:
 
     def __post_init__(self) -> None:
         """Validate archive-transformation settings."""
-        if self.max_files <= 0:
-            raise ValueError(
-                "Maximum file count must be a positive integer."
+        if not isinstance(self.image_options, ImageProcessingOptions):
+            raise TypeError(
+                "Image options must be an ImageProcessingOptions instance."
             )
+        if not isinstance(self.read_limits, ArchiveReadLimits):
+            raise TypeError(
+                "Archive read limits must be an ArchiveReadLimits instance."
+            )
+        if not isinstance(self.path_limits, ArchivePathLimits):
+            raise TypeError(
+                "Archive path limits must be an ArchivePathLimits instance."
+            )
+        if not isinstance(self.date_time_policy, MemberDateTimePolicy):
+            raise TypeError(
+                "Member date-time policy must be a "
+                "MemberDateTimePolicy instance."
+            )
+
+        validate_positive_integer(
+            self.max_files,
+            name="Maximum file count",
+        )
 
 
 @dataclass(frozen=True)
