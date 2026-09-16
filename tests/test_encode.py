@@ -661,6 +661,26 @@ class TestEncodeImage:
             if encoder_name != selected_encoder:
                 encoder.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "options",
+        [False, {}, "", object()],
+    )
+    def test_invalid_encoder_options_object_is_rejected(
+        self,
+        options: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(
+                "Encoder options must be an EncoderOptions instance."
+            ),
+        ):
+            encode_image(
+                Mock(spec=Image.Image),
+                output_format="JPEG",
+                options=options,  # type: ignore[arg-type]
+            )
+
     def test_unsupported_output_format_is_rejected(self) -> None:
         image = Image.new(
             mode="RGB",

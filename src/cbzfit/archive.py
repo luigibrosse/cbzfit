@@ -172,6 +172,21 @@ class MemberDateTimePolicy:
             validate_zip_date_time(self.fixed_date_time)
 
 
+def validate_positive_integer(
+    value: object,
+    *,
+    name: str,
+) -> int:
+    """Return a validated positive non-Boolean integer."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer.")
+
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer.")
+
+    return value
+
+
 @dataclass(frozen=True)
 class ArchivePathLimits:
     """Store limits applied to archive-member paths."""
@@ -181,15 +196,14 @@ class ArchivePathLimits:
 
     def __post_init__(self) -> None:
         """Validate archive-member path limits."""
-        if self.max_path_length <= 0:
-            raise ValueError(
-                "Maximum member path length must be a positive integer."
-            )
-
-        if self.max_component_length <= 0:
-            raise ValueError(
-                "Maximum path component length must be a positive integer."
-            )
+        validate_positive_integer(
+            self.max_path_length,
+            name="Maximum member path length",
+        )
+        validate_positive_integer(
+            self.max_component_length,
+            name="Maximum path component length",
+        )
 
 
 @dataclass(frozen=True)
@@ -225,41 +239,22 @@ class ArchiveReadLimits:
 
     def __post_init__(self) -> None:
         """Validate archive-member read limits."""
-        if self.max_file_size <= 0:
-            raise ValueError(
-                "Maximum file size must be a positive integer."
-            )
-
-        if self.max_total_size <= 0:
-            raise ValueError(
-                "Maximum total uncompressed size must be a positive integer."
-            )
-
-        if (
-            isinstance(self.max_expansion_ratio, bool)
-            or not isinstance(self.max_expansion_ratio, int)
-        ):
-            raise TypeError(
-                "Maximum expansion ratio must be an integer."
-            )
-
-        if self.max_expansion_ratio <= 0:
-            raise ValueError(
-                "Maximum expansion ratio must be a positive integer."
-            )
-
-        if (
-            isinstance(self.expansion_grace_size, bool)
-            or not isinstance(self.expansion_grace_size, int)
-        ):
-            raise TypeError(
-                "Expansion grace size must be an integer."
-            )
-
-        if self.expansion_grace_size <= 0:
-            raise ValueError(
-                "Expansion grace size must be a positive integer."
-            )
+        validate_positive_integer(
+            self.max_file_size,
+            name="Maximum file size",
+        )
+        validate_positive_integer(
+            self.max_total_size,
+            name="Maximum total uncompressed size",
+        )
+        validate_positive_integer(
+            self.max_expansion_ratio,
+            name="Maximum expansion ratio",
+        )
+        validate_positive_integer(
+            self.expansion_grace_size,
+            name="Expansion grace size",
+        )
 
 
 @dataclass
@@ -311,7 +306,14 @@ def validate_member_path(
     traversal, reserved device names, alternate-stream syntax, or components
     that portable filesystems normalize ambiguously.
     """
-    path_limits = limits or ArchivePathLimits()
+    if limits is None:
+        path_limits = ArchivePathLimits()
+    elif not isinstance(limits, ArchivePathLimits):
+        raise TypeError(
+            "Archive path limits must be an ArchivePathLimits instance."
+        )
+    else:
+        path_limits = limits
 
     if not filename:
         raise InvalidArchiveError(
@@ -743,17 +745,28 @@ def build_manifest(
     path_limits: ArchivePathLimits | None = None,
 ) -> ArchiveManifest:
     """Validate an open CBZ archive and describe its contents."""
-    member_read_limits = read_limits or ArchiveReadLimits()
-    member_path_limits = (
-        ArchivePathLimits()
-        if path_limits is None
-        else path_limits
+    validate_positive_integer(
+        max_files,
+        name="Maximum file count",
     )
 
-    if max_files <= 0:
-        raise ValueError(
-            "Maximum file count must be a positive integer."
+    if read_limits is None:
+        member_read_limits = ArchiveReadLimits()
+    elif not isinstance(read_limits, ArchiveReadLimits):
+        raise TypeError(
+            "Archive read limits must be an ArchiveReadLimits instance."
         )
+    else:
+        member_read_limits = read_limits
+
+    if path_limits is None:
+        member_path_limits = ArchivePathLimits()
+    elif not isinstance(path_limits, ArchivePathLimits):
+        raise TypeError(
+            "Archive path limits must be an ArchivePathLimits instance."
+        )
+    else:
+        member_path_limits = path_limits
 
     all_members = tuple(archive.infolist())
     file_members: list[ZipInfo] = []
