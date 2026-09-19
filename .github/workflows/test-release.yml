@@ -177,7 +177,7 @@ jobs:
               --index-url https://test.pypi.org/simple/ \
               --no-cache-dir \
               --no-deps \
-              cbzfit==0.1.0; then
+              cbzfit==0.1.1; then
               exit 0
             fi
 
@@ -190,8 +190,8 @@ jobs:
 
       - name: Verify installed entry points
         run: |
-          test "$(.testpypi-smoke/bin/cbzfit --version)" = "cbzfit 0.1.0"
-          test "$(.testpypi-smoke/bin/python -m cbzfit --version)" = "cbzfit 0.1.0"
+          test "$(.testpypi-smoke/bin/cbzfit --version)" = "cbzfit 0.1.1"
+          test "$(.testpypi-smoke/bin/python -m cbzfit --version)" = "cbzfit 0.1.1"
 
       - name: Process a generated CBZ with TestPyPI package
         run: |
