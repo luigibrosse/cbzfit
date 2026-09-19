@@ -189,8 +189,8 @@ jobs:
 
       - name: Verify installed entry points
         run: |
-          test "$(.package-smoke/bin/cbzfit --version)" = "cbzfit 0.1.0"
-          test "$(.package-smoke/bin/python -m cbzfit --version)" = "cbzfit 0.1.0"
+          test "$(.package-smoke/bin/cbzfit --version)" = "cbzfit 0.1.1"
+          test "$(.package-smoke/bin/python -m cbzfit --version)" = "cbzfit 0.1.1"
 
       - name: Process a generated CBZ with installed command
         run: |
