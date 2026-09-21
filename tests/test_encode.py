@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import re
 from collections.abc import Callable
 from io import BytesIO
 from unittest.mock import Mock
@@ -24,11 +23,7 @@ from cbzfit.encode import (
     save_webp,
 )
 from cbzfit.image import PreparedImage
-
-
-def exact_message(message: str) -> str:
-    """Return a regular expression that matches a complete error message."""
-    return rf"^{re.escape(message)}$"
+from tests.helpers import exact_message
 
 
 class TestEncoderOptions:

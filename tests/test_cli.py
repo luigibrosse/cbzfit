@@ -50,11 +50,7 @@ from cbzfit.progress import (
     ArchiveProgress,
     ArchiveProgressPhase,
 )
-
-
-def exact_message(message: str) -> str:
-    """Return a regular expression that matches a complete error message."""
-    return rf"^{re.escape(message)}$"
+from tests.helpers import exact_message
 
 
 def required_arguments() -> list[str]:
