@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import re
 from io import StringIO
 from unittest.mock import Mock
 
@@ -13,11 +12,7 @@ from cbzfit.progress import (
     TerminalProgressRenderer,
     report_progress,
 )
-
-
-def exact_message(message: str) -> str:
-    """Return a regular expression that matches a complete error message."""
-    return rf"^{re.escape(message)}$"
+from tests.helpers import exact_message
 
 
 class TestArchiveProgressPhase:

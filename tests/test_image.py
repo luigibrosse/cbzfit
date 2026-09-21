@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import re
 from unittest.mock import Mock
 
 import pytest
@@ -21,11 +20,7 @@ from cbzfit.image import (
     resize_for_display,
     validate_portrait_screen_size,
 )
-
-
-def exact_message(message: str) -> str:
-    """Return a regular expression that matches a complete error message."""
-    return rf"^{re.escape(message)}$"
+from tests.helpers import exact_message
 
 
 class TestInvalidScreenDimensionError:
@@ -1011,4 +1006,3 @@ class TestPrepareImageForFormat:
                 output_format=output_format,
                 preserve_icc_profile=False,
             )
-

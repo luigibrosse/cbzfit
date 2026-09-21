@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import re
 import stat
 from datetime import UTC, datetime
 from io import BytesIO
@@ -65,11 +64,7 @@ from cbzfit.archive import (
     validate_zip_date_time,
     write_member_data,
 )
-
-
-def exact_message(message: str) -> str:
-    """Return a regular expression that matches a complete error message."""
-    return rf"^{re.escape(message)}$"
+from tests.helpers import exact_message
 
 
 def create_archive(
