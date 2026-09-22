@@ -165,6 +165,8 @@ class TestImageProcessingOptions:
         assert options.use_landscape_display is True
         assert options.allow_upscale is False
         assert options.max_image_pixels == DEFAULT_MAX_IMAGE_PIXELS
+        assert options.output_format == "ORIGINAL"
+        assert options.reencode is False
         assert options.encoder_options == EncoderOptions()
 
     def test_custom_options_are_retained(self) -> None:
@@ -177,6 +179,8 @@ class TestImageProcessingOptions:
             use_landscape_display=False,
             allow_upscale=True,
             max_image_pixels=75_000_000,
+            output_format="WEBP",
+            reencode=True,
             encoder_options=encoder_options,
         )
 
@@ -184,7 +188,77 @@ class TestImageProcessingOptions:
         assert options.use_landscape_display is False
         assert options.allow_upscale is True
         assert options.max_image_pixels == 75_000_000
+        assert options.output_format == "WEBP"
+        assert options.reencode is True
         assert options.encoder_options is encoder_options
+
+    @pytest.mark.parametrize(
+        "output_format",
+        ["ORIGINAL", "JPEG", "PNG", "WEBP"],
+    )
+    def test_supported_output_format_is_retained(
+        self,
+        output_format: str,
+    ) -> None:
+        options = ImageProcessingOptions(
+            portrait_screen_size=(1404, 1872),
+            output_format=output_format,
+        )
+
+        assert options.output_format == output_format
+
+    @pytest.mark.parametrize(
+        "output_format",
+        [None, 1, True, object()],
+    )
+    def test_non_string_output_format_is_rejected(
+        self,
+        output_format: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message("Output format must be a string."),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                output_format=output_format,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "output_format",
+        ["", "original", "jpeg", "JPG", "AVIF", " JPEG "],
+    )
+    def test_unsupported_output_format_is_rejected(
+        self,
+        output_format: str,
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message(
+                "Output format must be ORIGINAL, JPEG, PNG, or WEBP."
+            ),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                output_format=output_format,
+            )
+
+    @pytest.mark.parametrize(
+        "reencode",
+        [0, 1, 1.0, "true", None, object()],
+    )
+    def test_non_boolean_reencode_is_rejected(
+        self,
+        reencode: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message("Re-encode must be a Boolean."),
+        ):
+            ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                reencode=reencode,  # type: ignore[arg-type]
+            )
 
     @pytest.mark.parametrize(
         "max_image_pixels",
@@ -554,6 +628,132 @@ class TestProcessImageData:
 
         with open_encoded_image(result.data) as image:
             assert image.format == expected_format
+
+    @pytest.mark.parametrize(
+        ("source_format", "filename", "output_format", "expected_format"),
+        [
+            ("JPEG", "001.jpg", "PNG", "PNG"),
+            ("JPEG", "001.jpg", "WEBP", "WEBP"),
+            ("PNG", "001.png", "JPEG", "JPEG"),
+            ("PNG", "001.png", "WEBP", "WEBP"),
+            ("WEBP", "001.webp", "JPEG", "JPEG"),
+            ("WEBP", "001.webp", "PNG", "PNG"),
+        ],
+    )
+    def test_different_output_format_requires_encoding(
+        self,
+        source_format: str,
+        filename: str,
+        output_format: str,
+        expected_format: str,
+    ) -> None:
+        source_data = create_encoded_image(source_format)
+
+        result = process_image_data(
+            source_data,
+            filename,
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format=output_format,
+            ),
+        )
+
+        assert result.data != source_data
+        assert result.format == expected_format
+        assert result.transformed is True
+        with open_encoded_image(result.data) as image:
+            assert image.format == expected_format
+            assert image.size == (10, 20)
+
+    @pytest.mark.parametrize(
+        ("image_format", "filename", "output_format"),
+        [
+            ("JPEG", "001.jpg", "ORIGINAL"),
+            ("PNG", "001.png", "ORIGINAL"),
+            ("WEBP", "001.webp", "ORIGINAL"),
+            ("JPEG", "001.jpg", "JPEG"),
+            ("PNG", "001.png", "PNG"),
+            ("WEBP", "001.webp", "WEBP"),
+        ],
+    )
+    def test_same_output_format_without_reencode_copies_source_bytes(
+        self,
+        image_format: str,
+        filename: str,
+        output_format: str,
+    ) -> None:
+        source_data = create_encoded_image(image_format)
+
+        result = process_image_data(
+            source_data,
+            filename,
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format=output_format,
+                encoder_options=EncoderOptions(jpeg_quality=1),
+            ),
+        )
+
+        assert result.data is source_data
+        assert result.format == image_format
+        assert result.transformed is False
+
+    @pytest.mark.parametrize(
+        ("image_format", "filename", "output_format"),
+        [
+            ("JPEG", "001.jpg", "ORIGINAL"),
+            ("PNG", "001.png", "ORIGINAL"),
+            ("WEBP", "001.webp", "ORIGINAL"),
+            ("JPEG", "001.jpg", "JPEG"),
+            ("PNG", "001.png", "PNG"),
+            ("WEBP", "001.webp", "WEBP"),
+        ],
+    )
+    def test_reencode_forces_same_format_encoding(
+        self,
+        image_format: str,
+        filename: str,
+        output_format: str,
+    ) -> None:
+        source_data = create_encoded_image(image_format)
+
+        result = process_image_data(
+            source_data,
+            filename,
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format=output_format,
+                reencode=True,
+            ),
+        )
+
+        assert result.format == image_format
+        assert result.transformed is True
+        with open_encoded_image(result.data) as image:
+            assert image.format == image_format
+            assert image.size == (10, 20)
+
+    def test_image_is_resized_and_converted(self) -> None:
+        source_data = create_encoded_image(
+            "PNG",
+            size=(20, 40),
+        )
+
+        result = process_image_data(
+            source_data,
+            "001.png",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format="WEBP",
+            ),
+        )
+
+        assert result.format == "WEBP"
+        assert result.transformed is True
+
+        with open_encoded_image(result.data) as image:
+            assert image.format == "WEBP"
+            assert image.size == (10, 20)
 
     @pytest.mark.parametrize(
         ("image_format", "filename", "extension_format"),
@@ -2218,6 +2418,50 @@ class TestVerifyOutputArchive:
 
 
 class TestTransformArchiveContents:
+    @pytest.mark.parametrize(
+        "output_format",
+        ["JPEG", "PNG", "WEBP"],
+    )
+    def test_archive_output_format_is_rejected_before_processing(
+        self,
+        output_format: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_stream = BytesIO()
+        destination_stream = BytesIO()
+        build_manifest = Mock()
+        monkeypatch.setattr(
+            process_module,
+            "build_manifest",
+            build_manifest,
+        )
+
+        with (
+            ZipFile(source_stream, mode="w") as source,
+            ZipFile(destination_stream, mode="w") as destination,
+        ):
+            with pytest.raises(
+                ValueError,
+                match=exact_message(
+                    "Archive output formats other than ORIGINAL require "
+                    "output-member renaming."
+                ),
+            ):
+                transform_archive_contents(
+                    source,
+                    destination,
+                    options=ArchiveTransformationOptions(
+                        image_options=ImageProcessingOptions(
+                            portrait_screen_size=(10, 20),
+                            output_format=output_format,
+                        ),
+                    ),
+                )
+
+            assert destination.namelist() == []
+
+        build_manifest.assert_not_called()
+
     def test_mixed_archive_is_transformed_in_original_order(self) -> None:
         large_image = create_encoded_image(
             "JPEG",
