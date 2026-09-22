@@ -47,25 +47,30 @@ class EncoderOptions:
 
     def __post_init__(self) -> None:
         """Validate encoder settings."""
-        if not 0 <= self.jpeg_quality <= 95:
-            raise ValueError(
-                "JPEG quality must be between 0 and 95."
-            )
+        integer_options = (
+            ("JPEG quality", self.jpeg_quality, 0, 95),
+            ("PNG compression level", self.png_compress_level, 0, 9),
+            ("WebP quality", self.webp_quality, 0, 100),
+            ("WebP method", self.webp_method, 0, 6),
+        )
+        for name, value, minimum, maximum in integer_options:
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer.")
+            if not minimum <= value <= maximum:
+                raise ValueError(
+                    f"{name} must be between {minimum} and {maximum}."
+                )
 
-        if not 0 <= self.png_compress_level <= 9:
-            raise ValueError(
-                "PNG compression level must be between 0 and 9."
-            )
-
-        if not 0 <= self.webp_quality <= 100:
-            raise ValueError(
-                "WebP quality must be between 0 and 100."
-            )
-
-        if not 0 <= self.webp_method <= 6:
-            raise ValueError(
-                "WebP method must be between 0 and 6."
-            )
+        boolean_options = (
+            ("JPEG optimize", self.jpeg_optimize),
+            ("JPEG progressive", self.jpeg_progressive),
+            ("PNG optimize", self.png_optimize),
+            ("WebP lossless", self.webp_lossless),
+            ("Preserve ICC profile", self.preserve_icc_profile),
+        )
+        for name, value in boolean_options:
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be a Boolean.")
 
 
 @dataclass(frozen=True)

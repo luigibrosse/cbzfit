@@ -34,125 +34,161 @@ class TestEncoderOptions:
         assert options.jpeg_quality == DEFAULT_JPEG_QUALITY
         assert options.jpeg_optimize is True
         assert options.jpeg_progressive is False
-
-        assert (
-            options.png_compress_level
-            == DEFAULT_PNG_COMPRESSION_LEVEL
-        )
+        assert options.png_compress_level == DEFAULT_PNG_COMPRESSION_LEVEL
         assert options.png_optimize is True
-
         assert options.webp_quality == DEFAULT_WEBP_QUALITY
         assert options.webp_method == DEFAULT_WEBP_METHOD
         assert options.webp_lossless is False
-
         assert options.preserve_icc_profile is True
 
     @pytest.mark.parametrize(
-        ("arguments", "attribute", "expected_value"),
+        ("argument", "value"),
         [
-            (
-                {"jpeg_quality": 0},
-                "jpeg_quality",
-                0,
-            ),
-            (
-                {"jpeg_quality": 95},
-                "jpeg_quality",
-                95,
-            ),
-            (
-                {"png_compress_level": 0},
-                "png_compress_level",
-                0,
-            ),
-            (
-                {"png_compress_level": 9},
-                "png_compress_level",
-                9,
-            ),
-            (
-                {"webp_quality": 0},
-                "webp_quality",
-                0,
-            ),
-            (
-                {"webp_quality": 100},
-                "webp_quality",
-                100,
-            ),
-            (
-                {"webp_method": 0},
-                "webp_method",
-                0,
-            ),
-            (
-                {"webp_method": 6},
-                "webp_method",
-                6,
-            ),
+            ("jpeg_quality", 0),
+            ("jpeg_quality", DEFAULT_JPEG_QUALITY),
+            ("jpeg_quality", 95),
+            ("png_compress_level", 0),
+            ("png_compress_level", DEFAULT_PNG_COMPRESSION_LEVEL),
+            ("png_compress_level", 9),
+            ("webp_quality", 0),
+            ("webp_quality", DEFAULT_WEBP_QUALITY),
+            ("webp_quality", 100),
+            ("webp_method", 0),
+            ("webp_method", DEFAULT_WEBP_METHOD),
+            ("webp_method", 6),
         ],
     )
-    def test_boundary_values_are_accepted(
+    def test_valid_integer_values_are_retained(
         self,
-        arguments: dict[str, int],
-        attribute: str,
-        expected_value: int,
+        argument: str,
+        value: int,
     ) -> None:
-        options = EncoderOptions(
-            **arguments,
-        )
+        options = EncoderOptions(**{argument: value})
 
-        assert getattr(options, attribute) == expected_value
+        assert getattr(options, argument) == value
+        assert type(getattr(options, argument)) is int
 
     @pytest.mark.parametrize(
-        ("arguments", "expected_message"),
+        ("argument", "value", "expected_message"),
         [
             (
-                {"jpeg_quality": -1},
+                "jpeg_quality",
+                -1,
                 "JPEG quality must be between 0 and 95.",
             ),
             (
-                {"jpeg_quality": 96},
+                "jpeg_quality",
+                96,
                 "JPEG quality must be between 0 and 95.",
             ),
             (
-                {"png_compress_level": -1},
+                "png_compress_level",
+                -1,
                 "PNG compression level must be between 0 and 9.",
             ),
             (
-                {"png_compress_level": 10},
+                "png_compress_level",
+                10,
                 "PNG compression level must be between 0 and 9.",
             ),
             (
-                {"webp_quality": -1},
+                "webp_quality",
+                -1,
                 "WebP quality must be between 0 and 100.",
             ),
             (
-                {"webp_quality": 101},
+                "webp_quality",
+                101,
                 "WebP quality must be between 0 and 100.",
             ),
             (
-                {"webp_method": -1},
+                "webp_method",
+                -1,
                 "WebP method must be between 0 and 6.",
             ),
             (
-                {"webp_method": 7},
+                "webp_method",
+                7,
                 "WebP method must be between 0 and 6.",
             ),
         ],
     )
-    def test_invalid_values_are_rejected(
+    def test_out_of_range_integer_values_are_rejected(
         self,
-        arguments: dict[str, int],
+        argument: str,
+        value: int,
         expected_message: str,
     ) -> None:
         with pytest.raises(
             ValueError,
             match=exact_message(expected_message),
         ):
-            EncoderOptions(
-                **arguments,
-            )
+            EncoderOptions(**{argument: value})
+
+    @pytest.mark.parametrize(
+        ("argument", "display_name"),
+        [
+            ("jpeg_quality", "JPEG quality"),
+            ("png_compress_level", "PNG compression level"),
+            ("webp_quality", "WebP quality"),
+            ("webp_method", "WebP method"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            False,
+            1.0,
+            "1",
+            None,
+            object(),
+        ],
+    )
+    def test_non_integer_values_are_rejected(
+        self,
+        argument: str,
+        display_name: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(f"{display_name} must be an integer."),
+        ):
+            EncoderOptions(**{argument: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("argument", "display_name"),
+        [
+            ("jpeg_optimize", "JPEG optimize"),
+            ("jpeg_progressive", "JPEG progressive"),
+            ("png_optimize", "PNG optimize"),
+            ("webp_lossless", "WebP lossless"),
+            ("preserve_icc_profile", "Preserve ICC profile"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "value",
+        [
+            0,
+            1,
+            1.0,
+            "true",
+            None,
+            object(),
+        ],
+    )
+    def test_non_boolean_values_are_rejected(
+        self,
+        argument: str,
+        display_name: str,
+        value: object,
+    ) -> None:
+        with pytest.raises(
+            TypeError,
+            match=exact_message(f"{display_name} must be a Boolean."),
+        ):
+            EncoderOptions(**{argument: value})  # type: ignore[arg-type]
 
     def test_custom_boolean_options_are_retained(self) -> None:
         options = EncoderOptions(
