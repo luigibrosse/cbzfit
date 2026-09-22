@@ -66,12 +66,27 @@ class ImageProcessingOptions:
     use_landscape_display: bool = True
     allow_upscale: bool = False
     max_image_pixels: int = DEFAULT_MAX_IMAGE_PIXELS
+    output_format: str = "ORIGINAL"
+    reencode: bool = False
     encoder_options: EncoderOptions = field(
         default_factory=EncoderOptions
     )
 
     def __post_init__(self) -> None:
         """Validate image-processing settings."""
+        if type(self.output_format) is not str:
+            raise TypeError("Output format must be a string.")
+        if self.output_format not in {
+            "ORIGINAL",
+            "JPEG",
+            "PNG",
+            "WEBP",
+        }:
+            raise ValueError(
+                "Output format must be ORIGINAL, JPEG, PNG, or WEBP."
+            )
+        if type(self.reencode) is not bool:
+            raise TypeError("Re-encode must be a Boolean.")
         if not isinstance(self.encoder_options, EncoderOptions):
             raise TypeError(
                 "Encoder options must be an EncoderOptions instance."
@@ -241,8 +256,18 @@ def process_image_data(
                 use_landscape_display=options.use_landscape_display,
                 allow_upscale=options.allow_upscale,
             )
+            output_format = (
+                source_format
+                if options.output_format == "ORIGINAL"
+                else options.output_format
+            )
+            requires_encoding = (
+                resized_image is not image
+                or output_format != source_format
+                or options.reencode
+            )
 
-            if resized_image is image:
+            if not requires_encoding:
                 return ProcessedImage(
                     data=data,
                     format=source_format,
@@ -252,11 +277,12 @@ def process_image_data(
             try:
                 encoded_image = encode_image(
                     resized_image,
-                    output_format=source_format,
+                    output_format=output_format,
                     options=options.encoder_options,
                 )
             finally:
-                resized_image.close()
+                if resized_image is not image:
+                    resized_image.close()
     return ProcessedImage(
         data=encoded_image.data,
         format=encoded_image.format,
@@ -282,6 +308,12 @@ def transform_archive_contents(
     Progress reports completed members, allowing a future coordinator to emit
     the same monotonic events when member processing becomes parallel.
     """
+    if options.image_options.output_format != "ORIGINAL":
+        raise ValueError(
+            "Archive output formats other than ORIGINAL require "
+            "output-member renaming."
+        )
+
     manifest = build_manifest(
         source_archive,
         max_files=options.max_files,
