@@ -14,7 +14,7 @@ from zipfile import (
 )
 
 import pytest
-from PIL import Image, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 
 import cbzfit.process as process_module
 from cbzfit.archive import (
@@ -128,6 +128,23 @@ def create_mock_opened_image() -> MagicMock:
     image.size = (10, 20)
 
     return image
+
+
+def create_exif_oriented_jpeg(
+    orientation: int | None,
+    *,
+    size: tuple[int, int] = (20, 10),
+) -> bytes:
+    """Create JPEG data with optional orientation and unrelated EXIF."""
+    image = Image.new("RGB", size, "white")
+    exif = image.getexif()
+    exif[ExifTags.Base.ImageDescription] = "unrelated metadata"
+    if orientation is not None:
+        exif[ExifTags.Base.Orientation] = orientation
+    output = BytesIO()
+    image.save(output, format="JPEG", exif=exif)
+    image.close()
+    return output.getvalue()
 
 
 def create_archive_file(
@@ -754,6 +771,150 @@ class TestProcessImageData:
         with open_encoded_image(result.data) as image:
             assert image.format == "WEBP"
             assert image.size == (10, 20)
+
+    def test_oriented_image_is_closed_when_resize_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_data = create_encoded_image("JPEG")
+        oriented_image = Mock(spec=Image.Image)
+        error = ValueError("Resize failed")
+        monkeypatch.setattr(
+            process_module,
+            "apply_exif_orientation",
+            Mock(return_value=oriented_image),
+        )
+        monkeypatch.setattr(
+            process_module,
+            "resize_for_display",
+            Mock(side_effect=error),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message("Resize failed"),
+        ) as exception_info:
+            process_image_data(
+                source_data,
+                "001.jpg",
+                options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            )
+
+        assert exception_info.value is error
+        oriented_image.close.assert_called_once_with()
+
+    @pytest.mark.parametrize("orientation", [0, 9])
+    def test_invalid_exif_orientation_is_rejected(
+        self,
+        orientation: int,
+    ) -> None:
+        source_data = create_exif_oriented_jpeg(orientation)
+        expected_message = (
+            f"Invalid EXIF orientation for '001.jpg': {orientation!r}."
+        )
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(expected_message),
+        ):
+            process_image_data(
+                source_data,
+                "001.jpg",
+                options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            )
+
+    def test_exif_orientation_is_applied_before_landscape_resize_decision(
+        self,
+    ) -> None:
+        source_data = create_exif_oriented_jpeg(
+            6,
+            size=(10, 20),
+        )
+
+        result = process_image_data(
+            source_data,
+            "001.jpg",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+
+        assert result.transformed is True
+        assert result.format == "JPEG"
+
+        with open_encoded_image(result.data) as image:
+            assert image.size == (20, 10)
+            assert image.getexif().get(
+                ExifTags.Base.Orientation
+            ) is None
+            assert (
+                image.getexif().get(
+                    ExifTags.Base.ImageDescription
+                )
+                == "unrelated metadata"
+            )
+
+    def test_exif_orientation_is_applied_before_resize_decision(self) -> None:
+        source_data = create_exif_oriented_jpeg(6, size=(20, 10))
+
+        result = process_image_data(
+            source_data,
+            "001.jpg",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+
+        assert result.transformed is True
+        assert result.format == "JPEG"
+        with open_encoded_image(result.data) as image:
+            assert image.size == (10, 20)
+            assert image.getexif().get(ExifTags.Base.Orientation) is None
+            assert image.getexif().get(ExifTags.Base.ImageDescription) == "unrelated metadata"
+
+    def test_encoded_orientation_is_not_applied_twice(self) -> None:
+        source_data = create_exif_oriented_jpeg(6, size=(20, 10))
+
+        result = process_image_data(
+            source_data,
+            "001.jpg",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+
+        with open_encoded_image(result.data) as image:
+            transposed = ImageOps.exif_transpose(image)
+            assert transposed.size == image.size == (10, 20)
+            assert transposed.get_flattened_data() == image.get_flattened_data()
+            if transposed is not image:
+                transposed.close()
+
+    @pytest.mark.parametrize("orientation", [None, 1])
+    def test_normal_or_missing_orientation_preserves_unchanged_bytes(
+        self,
+        orientation: int | None,
+    ) -> None:
+        source_data = create_exif_oriented_jpeg(
+            orientation,
+            size=(10, 20),
+        )
+
+        result = process_image_data(
+            source_data,
+            "001.jpg",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+            ),
+        )
+
+        assert result.data is source_data
+        assert result.format == "JPEG"
+        assert result.transformed is False
 
     @pytest.mark.parametrize(
         ("image_format", "filename", "extension_format"),

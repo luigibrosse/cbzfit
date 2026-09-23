@@ -43,6 +43,7 @@ from cbzfit.encode import (
     encode_image,
 )
 from cbzfit.image import (
+    apply_exif_orientation,
     resize_for_display,
     validate_portrait_screen_size,
 )
@@ -250,39 +251,48 @@ def process_image_data(
                     f"Image data could not be decoded: {filename!r}."
                 ) from error
 
-            resized_image = resize_for_display(
+            oriented_image = apply_exif_orientation(
                 image=image,
-                portrait_screen_size=options.portrait_screen_size,
-                use_landscape_display=options.use_landscape_display,
-                allow_upscale=options.allow_upscale,
+                filename=filename,
             )
-            output_format = (
-                source_format
-                if options.output_format == "ORIGINAL"
-                else options.output_format
-            )
-            requires_encoding = (
-                resized_image is not image
-                or output_format != source_format
-                or options.reencode
-            )
-
-            if not requires_encoding:
-                return ProcessedImage(
-                    data=data,
-                    format=source_format,
-                    transformed=False,
-                )
+            resized_image = oriented_image
 
             try:
+                resized_image = resize_for_display(
+                    image=oriented_image,
+                    portrait_screen_size=options.portrait_screen_size,
+                    use_landscape_display=options.use_landscape_display,
+                    allow_upscale=options.allow_upscale,
+                )
+                output_format = (
+                    source_format
+                    if options.output_format == "ORIGINAL"
+                    else options.output_format
+                )
+                requires_encoding = (
+                    oriented_image is not image
+                    or resized_image is not oriented_image
+                    or output_format != source_format
+                    or options.reencode
+                )
+
+                if not requires_encoding:
+                    return ProcessedImage(
+                        data=data,
+                        format=source_format,
+                        transformed=False,
+                    )
+
                 encoded_image = encode_image(
                     resized_image,
                     output_format=output_format,
                     options=options.encoder_options,
                 )
             finally:
-                if resized_image is not image:
+                if resized_image is not oriented_image:
                     resized_image.close()
+                if oriented_image is not image:
+                    oriented_image.close()
     return ProcessedImage(
         data=encoded_image.data,
         format=encoded_image.format,

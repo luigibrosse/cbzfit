@@ -238,33 +238,19 @@ class TestEncodedImage:
 
 
 class TestGetEncodingMetadata:
-
-    def test_icc_profile_none_is_returned_as_encoding_metadata(
-        self,
-    ) -> None:
-        image = Image.new(
-            mode="RGB",
-            size=(10, 20),
-            color="white",
-        )
-        prepared_image = PreparedImage(
-            image=image,
-        )
+    def test_missing_metadata_is_omitted(self) -> None:
+        image = Image.new("RGB", (10, 20), "white")
+        prepared_image = PreparedImage(image=image)
 
         result = get_encoding_metadata(prepared_image)
 
         assert result == {
             "icc_profile": None,
         }
+        image.close()
 
-    def test_icc_profile_is_returned_as_encoding_metadata(
-        self,
-    ) -> None:
-        image = Image.new(
-            mode="RGB",
-            size=(10, 20),
-            color="white",
-        )
+    def test_icc_profile_is_returned_when_present(self) -> None:
+        image = Image.new("RGB", (10, 20), "white")
         prepared_image = PreparedImage(
             image=image,
             icc_profile=b"embedded-icc-profile",
@@ -275,9 +261,82 @@ class TestGetEncodingMetadata:
         assert result == {
             "icc_profile": b"embedded-icc-profile",
         }
+        image.close()
+
+    def test_exif_is_returned_when_present(self) -> None:
+        image = Image.new("RGB", (10, 20), "white")
+        prepared_image = PreparedImage(
+            image=image,
+            exif=b"Exif\x00\x00metadata",
+        )
+
+        result = get_encoding_metadata(prepared_image)
+
+        assert result == {
+            "icc_profile": None,
+            "exif": b"Exif\x00\x00metadata",
+        }
+        image.close()
+
+    def test_all_metadata_is_returned_when_present(self) -> None:
+        image = Image.new("RGB", (10, 20), "white")
+        prepared_image = PreparedImage(
+            image=image,
+            icc_profile=b"embedded-icc-profile",
+            exif=b"Exif\x00\x00metadata",
+        )
+
+        result = get_encoding_metadata(prepared_image)
+
+        assert result == {
+            "icc_profile": b"embedded-icc-profile",
+            "exif": b"Exif\x00\x00metadata",
+        }
+        image.close()
 
 
 class TestSaveImage:
+
+    @pytest.mark.parametrize(
+        "save_function",
+        [
+            save_jpeg,
+            save_png,
+            save_webp,
+        ],
+    )
+    def test_exif_is_forwarded_to_image_save(
+        self,
+        save_function: Callable[
+            [Image.Image, BytesIO, EncoderOptions],
+            None,
+        ],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_image = Mock(spec=Image.Image)
+        compatible_image = Mock(spec=Image.Image)
+        destination = BytesIO()
+        prepared_image = PreparedImage(
+            image=compatible_image,
+            exif=b"Exif\x00\x00metadata",
+        )
+        prepare_image = Mock(return_value=prepared_image)
+        monkeypatch.setattr(
+            encode_module,
+            "prepare_image_for_format",
+            prepare_image,
+        )
+
+        save_function(
+            source_image,
+            destination,
+            EncoderOptions(),
+        )
+
+        assert (
+            compatible_image.save.call_args.kwargs["exif"]
+            == b"Exif\x00\x00metadata"
+        )
 
     @pytest.mark.parametrize(
         ("save_function", "format_options"),

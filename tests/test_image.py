@@ -3,18 +3,23 @@
 from unittest.mock import Mock
 
 import pytest
-from PIL import Image, ImageCms
+from PIL import ExifTags, Image, ImageCms
 
 import cbzfit.image as image_module
-from cbzfit.decode import UnsupportedImageFormatError
+from cbzfit.decode import (
+    UnsupportedImageContentError,
+    UnsupportedImageFormatError,
+)
 from cbzfit.image import (
     InvalidScreenDimensionError,
     InvalidScreenOrientationError,
     PreparedImage,
+    apply_exif_orientation,
     calculate_display_fit,
     convert_cmyk_to_rgb,
     fit_size_within,
     flatten_transparency_on_white,
+    get_embedded_exif,
     get_embedded_icc_profile,
     prepare_image_for_format,
     resize_for_display,
@@ -31,6 +36,73 @@ class TestInvalidScreenDimensionError:
 class TestInvalidScreenOrientationError:
     def test_error_is_a_value_error(self) -> None:
         assert issubclass(InvalidScreenOrientationError, ValueError)
+
+class TestPreparedImage:
+    @pytest.mark.parametrize(
+        ("argument", "display_name"),
+        [
+            ("icc_profile", "ICC profile"),
+            ("exif", "EXIF metadata"),
+        ],
+    )
+    @pytest.mark.parametrize("value", ["metadata", bytearray(b"metadata"), object()])
+    def test_non_bytes_metadata_is_rejected(
+        self,
+        argument: str,
+        display_name: str,
+        value: object,
+    ) -> None:
+        image = Image.new("RGB", (1, 1), "white")
+
+        with pytest.raises(
+            TypeError,
+            match=exact_message(f"{display_name} must be bytes."),
+        ):
+            PreparedImage(
+                image=image,
+                **{argument: value},  # type: ignore[arg-type]
+            )
+
+        image.close()
+
+    @pytest.mark.parametrize(
+        ("argument", "display_name"),
+        [
+            ("icc_profile", "ICC profile"),
+            ("exif", "EXIF metadata"),
+        ],
+    )
+    def test_empty_metadata_is_rejected(
+        self,
+        argument: str,
+        display_name: str,
+    ) -> None:
+        image = Image.new("RGB", (1, 1), "white")
+
+        with pytest.raises(
+            ValueError,
+            match=exact_message(f"{display_name} must not be empty."),
+        ):
+            PreparedImage(
+                image=image,
+                **{argument: b""},
+            )
+
+        image.close()
+
+    def test_valid_metadata_is_retained(self) -> None:
+        image = Image.new("RGB", (1, 1), "white")
+        prepared = PreparedImage(
+            image=image,
+            icc_profile=b"icc-profile",
+            exif=b"Exif\x00\x00metadata",
+        )
+
+        assert prepared.image is image
+        assert prepared.icc_profile == b"icc-profile"
+        assert prepared.exif == b"Exif\x00\x00metadata"
+        image.close()
+
 
 class TestValidatePortraitScreenSize:
 
@@ -384,6 +456,123 @@ class TestResizeForDisplay:
         assert result.size == (1324, 1872)
         assert result is not image
 
+class TestApplyExifOrientation:
+    @staticmethod
+    def create_oriented_image(orientation: object) -> Image.Image:
+        image = Image.new("RGB", (3, 2))
+        image.putdata(
+            [
+                (255, 0, 0),
+                (0, 255, 0),
+                (0, 0, 255),
+                (255, 255, 0),
+                (255, 0, 255),
+                (0, 255, 255),
+            ]
+        )
+        exif = image.getexif()
+        exif[ExifTags.Base.ImageDescription] = "unrelated metadata"
+        exif[ExifTags.Base.Orientation] = orientation
+        image.info["exif"] = exif.tobytes()
+        return image
+
+    @pytest.mark.parametrize(
+        ("orientation", "transpose"),
+        [
+            (2, Image.Transpose.FLIP_LEFT_RIGHT),
+            (3, Image.Transpose.ROTATE_180),
+            (4, Image.Transpose.FLIP_TOP_BOTTOM),
+            (5, Image.Transpose.TRANSPOSE),
+            (6, Image.Transpose.ROTATE_270),
+            (7, Image.Transpose.TRANSVERSE),
+            (8, Image.Transpose.ROTATE_90),
+        ],
+    )
+    def test_non_default_orientation_is_applied(
+        self,
+        orientation: int,
+        transpose: Image.Transpose,
+    ) -> None:
+        image = self.create_oriented_image(orientation)
+        expected = image.transpose(transpose)
+
+        result = apply_exif_orientation(image, "001.jpg")
+
+        assert result is not image
+        assert result.size == expected.size
+        assert result.get_flattened_data() == expected.get_flattened_data()
+        assert result.getexif().get(ExifTags.Base.Orientation) is None
+        assert (
+            result.getexif().get(ExifTags.Base.ImageDescription)
+            == "unrelated metadata"
+        )
+
+        result.close()
+        expected.close()
+        image.close()
+
+    def test_normal_orientation_returns_original_image(self) -> None:
+        image = self.create_oriented_image(1)
+
+        result = apply_exif_orientation(image, "001.jpg")
+
+        assert result is image
+        assert result.getexif().get(ExifTags.Base.Orientation) == 1
+        image.close()
+
+    def test_missing_orientation_returns_original_image(self) -> None:
+        image = Image.new("RGB", (3, 2), "white")
+
+        result = apply_exif_orientation(image, "001.jpg")
+
+        assert result is image
+        assert result.getexif().get(ExifTags.Base.Orientation) is None
+        image.close()
+
+    @pytest.mark.parametrize(
+        "orientation",
+        [0, -1, 9, True, False, 1.0, "1"],
+    )
+    def test_invalid_orientation_is_rejected(
+        self,
+        orientation: object,
+    ) -> None:
+        image = Mock(spec=Image.Image)
+        exif = Mock()
+        exif.get.return_value = orientation
+        image.getexif.return_value = exif
+        expected_message = (
+            f"Invalid EXIF orientation for '001.jpg': {orientation!r}."
+        )
+
+        with pytest.raises(
+            UnsupportedImageContentError,
+            match=exact_message(expected_message),
+        ):
+            apply_exif_orientation(image, "001.jpg")
+
+
+
+class TestGetEmbeddedExif:
+    def test_embedded_exif_is_returned(self) -> None:
+        image = Image.new("RGB", (3, 2), "white")
+        exif = image.getexif()
+        exif[ExifTags.Base.ImageDescription] = "description"
+        image.info["exif"] = exif.tobytes()
+
+        assert get_embedded_exif(image) == exif.tobytes()
+        image.close()
+
+    @pytest.mark.parametrize("value", [None, b"", "not-bytes", object()])
+    def test_missing_or_invalid_exif_is_omitted(self, value: object) -> None:
+        image = Image.new("RGB", (3, 2), "white")
+        if value is not None:
+            image.info["exif"] = value
+
+        assert get_embedded_exif(image) is None
+        image.close()
+
+
 class TestGetEmbeddedIccProfile:
 
     def test_missing_icc_profile_returns_none(self) -> None:
@@ -647,6 +836,22 @@ class TestConvertCmykToRgb:
         target_profile.tobytes.assert_not_called()
 
 class TestPrepareImageForFormat:
+    def test_compatible_image_preserves_embedded_exif(self) -> None:
+        image = Image.new("RGB", (10, 20), "white")
+        exif = image.getexif()
+        exif[ExifTags.Base.ImageDescription] = "description"
+        image.info["exif"] = exif.tobytes()
+
+        result = prepare_image_for_format(
+            image,
+            output_format="JPEG",
+            preserve_icc_profile=True,
+        )
+
+        assert result.image is image
+        assert result.exif == exif.tobytes()
+        image.close()
+
 
     def test_rgb_image_is_already_compatible_with_jpeg(self) -> None:
         image = Image.new(
