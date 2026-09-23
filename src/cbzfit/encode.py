@@ -95,9 +95,14 @@ def get_encoding_metadata(
     prepared_image: PreparedImage,
 ) -> dict[str, bytes | None]:
     """Return metadata to include when encoding a prepared image."""
-    return {
+    metadata: dict[str, bytes | None] = {
         "icc_profile": prepared_image.icc_profile,
     }
+
+    if prepared_image.exif is not None:
+        metadata["exif"] = prepared_image.exif
+
+    return metadata
 
 
 def save_jpeg(

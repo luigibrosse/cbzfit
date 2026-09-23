@@ -3,9 +3,10 @@
 from dataclasses import dataclass
 from io import BytesIO
 
-from PIL import Image, ImageCms
+from PIL import ExifTags, Image, ImageCms, ImageOps
 
 from cbzfit.decode import (
+    UnsupportedImageContentError,
     UnsupportedImageFormatError,
     normalize_image_format,
 )
@@ -40,10 +41,23 @@ def validate_portrait_screen_size(
 
 @dataclass(frozen=True)
 class PreparedImage:
-    """Contain a format-compatible image and optional ICC profile."""
+    """Contain a format-compatible image and safe encoding metadata."""
 
     image: Image.Image
     icc_profile: bytes | None = None
+    exif: bytes | None = None
+
+    def __post_init__(self) -> None:
+        """Validate prepared-image metadata."""
+        for name, value in (
+            ("ICC profile", self.icc_profile),
+            ("EXIF metadata", self.exif),
+        ):
+            if value is not None:
+                if type(value) is not bytes:
+                    raise TypeError(f"{name} must be bytes.")
+                if not value:
+                    raise ValueError(f"{name} must not be empty.")
 
 
 def fit_size_within(
@@ -147,10 +161,46 @@ def get_embedded_icc_profile(
     """Return the embedded ICC profile when present."""
     icc_profile = image.info.get("icc_profile")
 
-    if isinstance(icc_profile, bytes):
+    if isinstance(icc_profile, bytes) and icc_profile:
         return icc_profile
 
     return None
+
+
+def get_embedded_exif(
+    image: Image.Image,
+) -> bytes | None:
+    """Return embedded EXIF bytes when present."""
+    exif = image.info.get("exif")
+
+    if isinstance(exif, bytes) and exif:
+        return exif
+
+    return None
+
+
+def apply_exif_orientation(
+    image: Image.Image,
+    filename: str,
+) -> Image.Image:
+    """Apply a valid non-default EXIF orientation to the image pixels."""
+    orientation = image.getexif().get(
+        ExifTags.Base.Orientation
+    )
+
+    if orientation is None:
+        return image
+
+    if type(orientation) is not int or orientation not in range(1, 9):
+        raise UnsupportedImageContentError(
+            f"Invalid EXIF orientation for {filename!r}: "
+            f"{orientation!r}."
+        )
+
+    if orientation == 1:
+        return image
+
+    return ImageOps.exif_transpose(image)
 
 
 def convert_cmyk_to_rgb(
@@ -229,6 +279,7 @@ def prepare_image_for_format(
     )
 
     source_icc_profile = get_embedded_icc_profile(image)
+    source_exif = get_embedded_exif(image)
 
     working_image = image
     prepared_icc_profile: bytes | None = None
@@ -282,26 +333,18 @@ def prepare_image_for_format(
             f"Unsupported image format: {output_format!r}."
         )
 
-    if prepared_icc_profile is not None:
-        return PreparedImage(
-            image=compatible_image,
-            icc_profile=prepared_icc_profile,
-        )
-
-    mode_was_preserved = (
-        compatible_image.mode == image.mode
-    )
+    mode_was_preserved = compatible_image.mode == image.mode
+    output_icc_profile = prepared_icc_profile
 
     if (
-        preserve_icc_profile
+        output_icc_profile is None
+        and preserve_icc_profile
         and mode_was_preserved
-        and source_icc_profile is not None
     ):
-        return PreparedImage(
-            image=compatible_image,
-            icc_profile=source_icc_profile,
-        )
+        output_icc_profile = source_icc_profile
 
     return PreparedImage(
         image=compatible_image,
+        icc_profile=output_icc_profile,
+        exif=source_exif,
     )
