@@ -5,7 +5,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
 from time import perf_counter
 from warnings import catch_warnings, simplefilter
@@ -22,13 +22,16 @@ from cbzfit.archive import (
     ARCHIVE_MEMBER_READ_ERRORS,
     DEFAULT_MAX_ARCHIVE_FILES,
     DEFAULT_MEMBER_READ_CHUNK_SIZE,
+    ArchiveManifest,
     ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
     InvalidArchiveError,
     MemberDateTimePolicy,
     build_manifest,
+    portable_member_path_key,
     read_member_data,
+    validate_member_path,
     validate_positive_integer,
     write_member_data,
 )
@@ -39,6 +42,7 @@ from cbzfit.decode import (
     validate_source_image,
 )
 from cbzfit.encode import (
+    FORMAT_EXTENSIONS,
     EncoderOptions,
     encode_image,
 )
@@ -300,6 +304,67 @@ def process_image_data(
     )
 
 
+def resolve_output_member_filename(
+    filename: str,
+    *,
+    output_format: str,
+    path_limits: ArchivePathLimits,
+) -> str:
+    """Return the validated final path for one archive image member."""
+    normalized_filename = validate_member_path(filename, limits=path_limits)
+    if output_format == "ORIGINAL":
+        return normalized_filename
+    output_filename = PurePosixPath(normalized_filename).with_suffix(
+        FORMAT_EXTENSIONS[output_format]
+    ).as_posix()
+    return validate_member_path(output_filename, limits=path_limits)
+
+
+def precompute_output_member_filenames(
+    manifest: ArchiveManifest,
+    *,
+    output_format: str,
+    path_limits: ArchivePathLimits,
+) -> dict[str, str]:
+    """Resolve and validate every final member path before processing data."""
+    image_filenames = {member.filename for member in manifest.image_members}
+    output_filenames: dict[str, str] = {}
+    seen_paths: dict[str, str] = {}
+    seen_portable_paths: dict[str, tuple[str, str]] = {}
+    for member in manifest.file_members:
+        if member.filename in image_filenames:
+            output_filename = resolve_output_member_filename(
+                member.filename,
+                output_format=output_format,
+                path_limits=path_limits,
+            )
+        else:
+            output_filename = validate_member_path(
+                member.filename, limits=path_limits
+            )
+        conflicting_source = seen_paths.get(output_filename)
+        if conflicting_source is not None:
+            raise InvalidArchiveError(
+                "Output member path collision after image conversion: "
+                f"{output_filename!r} from {conflicting_source!r} and "
+                f"{member.filename!r}."
+            )
+        seen_paths[output_filename] = member.filename
+        portable_path = portable_member_path_key(output_filename)
+        portable_conflict = seen_portable_paths.get(portable_path)
+        if portable_conflict is not None:
+            conflicting_source, conflicting_output = portable_conflict
+            raise InvalidArchiveError(
+                "Output member paths collide across filesystems after image "
+                f"conversion: {conflicting_output!r} from "
+                f"{conflicting_source!r} and {output_filename!r} from "
+                f"{member.filename!r}."
+            )
+        seen_portable_paths[portable_path] = (member.filename, output_filename)
+        output_filenames[member.filename] = output_filename
+    return output_filenames
+
+
 def transform_archive_contents(
     source_archive: ZipFile,
     destination_archive: ZipFile,
@@ -318,12 +383,6 @@ def transform_archive_contents(
     Progress reports completed members, allowing a future coordinator to emit
     the same monotonic events when member processing becomes parallel.
     """
-    if options.image_options.output_format != "ORIGINAL":
-        raise ValueError(
-            "Archive output formats other than ORIGINAL require "
-            "output-member renaming."
-        )
-
     manifest = build_manifest(
         source_archive,
         max_files=options.max_files,
@@ -331,6 +390,11 @@ def transform_archive_contents(
         path_limits=options.path_limits,
     )
 
+    output_filenames = precompute_output_member_filenames(
+        manifest,
+        output_format=options.image_options.output_format,
+        path_limits=options.path_limits,
+    )
     total_file_members = len(manifest.file_members)
     report_progress(
         progress_callback,
@@ -370,14 +434,22 @@ def transform_archive_contents(
             )
             output_data = processed_image.data
 
+            output_filename = output_filenames[member.filename]
+            source_filename = validate_member_path(
+                member.filename, limits=options.path_limits
+            )
             write_member_data(
                 destination_archive,
                 member,
                 output_data,
                 compression=ZIP_STORED,
                 date_time_policy=options.date_time_policy,
-                transformed=processed_image.transformed,
+                transformed=(
+                    processed_image.transformed
+                    or output_filename != source_filename
+                ),
                 path_limits=options.path_limits,
+                filename=output_filename,
             )
 
             if processed_image.transformed:
