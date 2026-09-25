@@ -14,7 +14,7 @@ from zipfile import (
 )
 
 import pytest
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageCms, ImageOps, UnidentifiedImageError
 
 import cbzfit.process as process_module
 from cbzfit.archive import (
@@ -26,6 +26,7 @@ from cbzfit.archive import (
     DOS_ATTRIBUTE_TEMPORARY,
     ZIP_CREATOR_DOS,
     ZIP_CREATOR_UNIX,
+    ArchiveManifest,
     ArchivePathLimits,
     ArchiveReadLimits,
     ArchiveReadState,
@@ -52,8 +53,10 @@ from cbzfit.process import (
     OutputVerificationMode,
     ProcessedImage,
     SourceDestinationConflictError,
+    precompute_output_member_filenames,
     process_archive_file,
     process_image_data,
+    resolve_output_member_filename,
     transform_archive_contents,
 )
 from cbzfit.progress import (
@@ -1480,6 +1483,104 @@ class TestProcessImageData:
         encode.assert_not_called()
 
 
+
+    @pytest.mark.parametrize(
+        ("mode", "color", "filename", "expected_pixel"),
+        [
+            ("RGBA", (10, 20, 30, 0), "rgba.png", (255, 255, 255)),
+            ("RGBA", (10, 20, 30, 128), "partial-alpha.png", (132, 137, 142)),
+            ("LA", (20, 128), "grayscale-alpha.png", (137, 137, 137)),
+        ],
+    )
+    def test_transparency_is_composited_on_white_for_jpeg_output(
+        self,
+        mode: str,
+        color: tuple[int, ...],
+        filename: str,
+        expected_pixel: tuple[int, int, int],
+    ) -> None:
+        result = process_image_data(
+            create_encoded_image(
+                "PNG",
+                mode=mode,
+                color=color,
+            ),
+            filename,
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format="JPEG",
+            ),
+        )
+        with open_encoded_image(result.data) as image:
+            assert image.format == "JPEG"
+            assert image.mode == "RGB"
+            assert image.getpixel((0, 0)) == pytest.approx(
+                expected_pixel,
+                abs=2,
+            )
+        assert result.format == "JPEG"
+        assert result.transformed is True
+
+    def test_palette_transparency_is_composited_on_white_for_jpeg_output(
+        self,
+    ) -> None:
+        image = Image.new("P", (10, 20), color=0)
+        image.putpalette([10, 20, 30] + [0, 0, 0] * 255)
+        image.info["transparency"] = 0
+        source = BytesIO()
+        try:
+            image.save(source, format="PNG")
+        finally:
+            image.close()
+        result = process_image_data(
+            source.getvalue(),
+            "palette.png",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format="JPEG",
+            ),
+        )
+        with open_encoded_image(result.data) as output:
+            assert output.format == "JPEG"
+            assert output.mode == "RGB"
+            assert output.getpixel((0, 0)) == pytest.approx(
+                (255, 255, 255),
+                abs=1,
+            )
+        assert result.format == "JPEG"
+        assert result.transformed is True
+
+    @pytest.mark.parametrize(
+        ("source_format", "filename", "output_format", "encoder_options"),
+        [
+            ("WEBP", "page.webp", "PNG", EncoderOptions()),
+            ("PNG", "page.png", "WEBP", EncoderOptions(webp_lossless=True)),
+        ],
+    )
+    def test_transparency_is_preserved_by_transparent_output_formats(
+        self,
+        source_format: str,
+        filename: str,
+        output_format: str,
+        encoder_options: EncoderOptions,
+    ) -> None:
+        result = process_image_data(
+            create_encoded_image(
+                source_format, mode="RGBA", color=(10, 20, 30, 128)
+            ),
+            filename,
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format=output_format,
+                encoder_options=encoder_options,
+            ),
+        )
+        with open_encoded_image(result.data) as image:
+            assert image.convert("RGBA").getpixel((0, 0))[3] == 128
+        assert result.format == output_format
+        assert result.transformed is True
+
+
 class TestArchiveTransformationOptions:
     def test_default_options_are_created(self) -> None:
         image_options = ImageProcessingOptions(
@@ -2578,51 +2679,162 @@ class TestVerifyOutputArchive:
         archive_context.__exit__.assert_called_once()
 
 
-class TestTransformArchiveContents:
+class TestResolveOutputMemberFilename:
+    def test_original_preserves_extension_and_normalizes_path(self) -> None:
+        assert resolve_output_member_filename(
+            r"Chapter 01\page.v2.JPEG",
+            output_format="ORIGINAL",
+            path_limits=ArchivePathLimits(),
+        ) == "Chapter 01/page.v2.JPEG"
+
     @pytest.mark.parametrize(
-        "output_format",
-        ["JPEG", "PNG", "WEBP"],
+        ("output_format", "extension"),
+        [("JPEG", ".jpg"), ("PNG", ".png"), ("WEBP", ".webp")],
     )
-    def test_archive_output_format_is_rejected_before_processing(
-        self,
-        output_format: str,
-        monkeypatch: pytest.MonkeyPatch,
+    def test_explicit_format_replaces_only_the_final_suffix(
+        self, output_format: str, extension: str
     ) -> None:
-        source_stream = BytesIO()
-        destination_stream = BytesIO()
-        build_manifest = Mock()
-        monkeypatch.setattr(
-            process_module,
-            "build_manifest",
-            build_manifest,
+        assert resolve_output_member_filename(
+            r"Chapter 01\page.v2.JPEG",
+            output_format=output_format,
+            path_limits=ArchivePathLimits(),
+        ) == f"Chapter 01/page.v2{extension}"
+
+    def test_generated_path_is_revalidated(self) -> None:
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Archive member contains a path component longer than "
+                "5 characters: 'a.webp'."
+            ),
+        ):
+            resolve_output_member_filename(
+                "a.jpg",
+                output_format="WEBP",
+                path_limits=ArchivePathLimits(max_component_length=5),
+            )
+
+
+class TestPrecomputeOutputMemberFilenames:
+    def test_resolves_images_and_preserves_other_member_paths(self) -> None:
+        image = ZipInfo(r"Chapter 01\page.v2.PNG")
+        other = ZipInfo(r"Chapter 01\ComicInfo.xml")
+        manifest = ArchiveManifest(
+            file_members=(image, other),
+            image_members=(image,),
+            other_members=(other,),
         )
 
-        with (
-            ZipFile(source_stream, mode="w") as source,
-            ZipFile(destination_stream, mode="w") as destination,
+        result = precompute_output_member_filenames(
+            manifest,
+            output_format="WEBP",
+            path_limits=ArchivePathLimits(),
+        )
+
+        assert list(result.items()) == [
+            (image.filename, "Chapter 01/page.v2.webp"),
+            (other.filename, "Chapter 01/ComicInfo.xml"),
+        ]
+
+    def test_exact_conversion_collision_is_rejected(self) -> None:
+        first, second = ZipInfo("page.jpeg"), ZipInfo("page.png")
+        manifest = ArchiveManifest(
+            file_members=(first, second),
+            image_members=(first, second),
+            other_members=(),
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Output member path collision after image conversion: "
+                "'page.jpg' from 'page.jpeg' and 'page.png'."
+            ),
         ):
-            with pytest.raises(
-                ValueError,
-                match=exact_message(
-                    "Archive output formats other than ORIGINAL require "
-                    "output-member renaming."
-                ),
-            ):
-                transform_archive_contents(
-                    source,
-                    destination,
-                    options=ArchiveTransformationOptions(
-                        image_options=ImageProcessingOptions(
-                            portrait_screen_size=(10, 20),
-                            output_format=output_format,
-                        ),
-                    ),
-                )
+            precompute_output_member_filenames(
+                manifest,
+                output_format="JPEG",
+                path_limits=ArchivePathLimits(),
+            )
 
-            assert destination.namelist() == []
+    @pytest.mark.parametrize(
+        ("first_name", "second_name", "first_output", "second_output"),
+        [
+            ("Page.png", "page.jpeg", "Page.jpg", "page.jpg"),
+            ("Café.png", "Cafe\u0301.jpeg", "Café.jpg", "Cafe\u0301.jpg"),
+        ],
+    )
+    def test_portable_conversion_collision_is_rejected(
+        self,
+        first_name: str,
+        second_name: str,
+        first_output: str,
+        second_output: str,
+    ) -> None:
+        first, second = ZipInfo(first_name), ZipInfo(second_name)
+        manifest = ArchiveManifest(
+            file_members=(first, second),
+            image_members=(first, second),
+            other_members=(),
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Output member paths collide across filesystems after image "
+                f"conversion: {first_output!r} from {first_name!r} and "
+                f"{second_output!r} from {second_name!r}."
+            ),
+        ):
+            precompute_output_member_filenames(
+                manifest,
+                output_format="JPEG",
+                path_limits=ArchivePathLimits(),
+            )
 
-        build_manifest.assert_not_called()
+    def test_collision_with_other_member_is_rejected_defensively(self) -> None:
+        image, other = ZipInfo("page.png"), ZipInfo("page.jpg")
+        manifest = ArchiveManifest(
+            file_members=(image, other),
+            image_members=(image,),
+            other_members=(other,),
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Output member path collision after image conversion: "
+                "'page.jpg' from 'page.png' and 'page.jpg'."
+            ),
+        ):
+            precompute_output_member_filenames(
+                manifest,
+                output_format="JPEG",
+                path_limits=ArchivePathLimits(),
+            )
 
+    def test_portable_collision_with_other_member_is_rejected_defensively(
+        self,
+    ) -> None:
+        image, other = ZipInfo("Page.png"), ZipInfo("page.jpg")
+        manifest = ArchiveManifest(
+            file_members=(image, other),
+            image_members=(image,),
+            other_members=(other,),
+        )
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Output member paths collide across filesystems after image "
+                "conversion: 'Page.jpg' from 'Page.png' and "
+                "'page.jpg' from 'page.jpg'."
+            ),
+        ):
+            precompute_output_member_filenames(
+                manifest,
+                output_format="JPEG",
+                path_limits=ArchivePathLimits(),
+            )
+
+
+class TestTransformArchiveContents:
     def test_mixed_archive_is_transformed_in_original_order(self) -> None:
         large_image = create_encoded_image(
             "JPEG",
@@ -2775,6 +2987,7 @@ class TestTransformArchiveContents:
             date_time_policy=policy,
             transformed=False,
             path_limits=path_limits,
+            filename="001.png",
         )
 
         assert result.transformed_images == 0
@@ -2930,6 +3143,7 @@ class TestTransformArchiveContents:
             "date_time_policy": policy,
             "transformed": True,
             "path_limits": path_limits,
+            "filename": "001.jpg",
         }
 
         assert write.call_args_list[1].args == (
@@ -3225,6 +3439,175 @@ class TestTransformArchiveContents:
         assert read.call_count == 1
         assert process_image.call_count == 1
         assert write.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("output_format", "extension"),
+        [("JPEG", ".jpg"), ("PNG", ".png"), ("WEBP", ".webp")],
+    )
+    def test_explicit_format_converts_image_and_preserves_member_order(
+        self, output_format: str, extension: str
+    ) -> None:
+        source_stream, destination_stream = BytesIO(), BytesIO()
+        with ZipFile(source_stream, mode="w") as archive:
+            archive.writestr(
+                "nested/page.v2.PNG", create_encoded_image("PNG")
+            )
+            archive.writestr("ComicInfo.xml", b"metadata")
+        source_stream.seek(0)
+        with (
+            ZipFile(source_stream, mode="r") as source,
+            ZipFile(destination_stream, mode="w") as destination,
+        ):
+            result = transform_archive_contents(
+                source,
+                destination,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                        output_format=output_format,
+                    )
+                ),
+            )
+        destination_stream.seek(0)
+        output_name = f"nested/page.v2{extension}"
+        with ZipFile(destination_stream, mode="r") as destination:
+            assert destination.namelist() == [output_name, "ComicInfo.xml"]
+            output_data = destination.read(output_name)
+            assert destination.read("ComicInfo.xml") == b"metadata"
+        with open_encoded_image(output_data) as image:
+            assert image.format == output_format
+        assert result.image_members == 1
+        assert result.copied_other_members == 1
+
+    def test_filename_only_change_marks_member_metadata_as_transformed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        source, destination = Mock(spec=ZipFile), Mock(spec=ZipFile)
+        member = ZipInfo("page.PNG")
+        manifest = ArchiveManifest(
+            file_members=(member,), image_members=(member,), other_members=()
+        )
+        source_data = b"unchanged"
+        monkeypatch.setattr(
+            process_module, "build_manifest", Mock(return_value=manifest)
+        )
+        monkeypatch.setattr(
+            process_module, "read_member_data", Mock(return_value=source_data)
+        )
+        monkeypatch.setattr(
+            process_module,
+            "process_image_data",
+            Mock(return_value=ProcessedImage(source_data, "PNG", False)),
+        )
+        write = Mock()
+        monkeypatch.setattr(process_module, "write_member_data", write)
+        result = transform_archive_contents(
+            source,
+            destination,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20), output_format="PNG"
+                )
+            ),
+        )
+        assert write.call_args.kwargs["filename"] == "page.png"
+        assert write.call_args.kwargs["transformed"] is True
+        assert result.transformed_images == 0
+        assert result.unchanged_images == 1
+
+    def test_conversion_preserves_icc_and_safe_exif_without_orientation(
+        self,
+    ) -> None:
+        icc_profile = ImageCms.ImageCmsProfile(
+            ImageCms.createProfile("sRGB")
+        ).tobytes()
+        image = Image.new("RGB", (20, 10), "white")
+        exif = image.getexif()
+        exif[ExifTags.Base.ImageDescription] = "unrelated metadata"
+        exif[ExifTags.Base.Orientation] = 6
+        source_image = BytesIO()
+        try:
+            image.save(
+                source_image,
+                format="JPEG",
+                exif=exif,
+                icc_profile=icc_profile,
+            )
+        finally:
+            image.close()
+
+        source_stream, destination_stream = BytesIO(), BytesIO()
+        with ZipFile(source_stream, mode="w") as archive:
+            archive.writestr("page.jpg", source_image.getvalue())
+        source_stream.seek(0)
+
+        with (
+            ZipFile(source_stream, mode="r") as source,
+            ZipFile(destination_stream, mode="w") as destination,
+        ):
+            transform_archive_contents(
+                source,
+                destination,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                        output_format="PNG",
+                    )
+                ),
+            )
+
+        with open_encoded_image(
+            _read_zip_member(destination_stream, "page.png")
+        ) as output_image:
+            output_exif = output_image.getexif()
+            assert output_image.size == (10, 20)
+            assert output_image.info["icc_profile"] == icc_profile
+            assert (
+                output_exif[ExifTags.Base.ImageDescription]
+                == "unrelated metadata"
+            )
+            assert ExifTags.Base.Orientation not in output_exif
+
+    @pytest.mark.parametrize(
+        ("first_name", "second_name"),
+        [
+            ("page.jpeg", "page.png"),
+            ("Page.png", "page.jpeg"),
+        ],
+        ids=["exact", "portable"],
+    )
+    def test_collision_preflight_precedes_progress_reads_and_writes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        first_name: str,
+        second_name: str,
+    ) -> None:
+        source_stream, destination_stream = BytesIO(), BytesIO()
+        with ZipFile(source_stream, mode="w") as archive:
+            archive.writestr(first_name, create_encoded_image("JPEG"))
+            archive.writestr(second_name, create_encoded_image("PNG"))
+        source_stream.seek(0)
+        read, write, progress = Mock(), Mock(), Mock()
+        monkeypatch.setattr(process_module, "read_member_data", read)
+        monkeypatch.setattr(process_module, "write_member_data", write)
+        with (
+            ZipFile(source_stream, mode="r") as source,
+            ZipFile(destination_stream, mode="w") as destination,
+            pytest.raises(InvalidArchiveError),
+        ):
+            transform_archive_contents(
+                source,
+                destination,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20), output_format="JPEG"
+                    )
+                ),
+                progress_callback=progress,
+            )
+        read.assert_not_called()
+        write.assert_not_called()
+        progress.assert_not_called()
 
 
 class TestProcessArchiveFile:
@@ -4860,4 +5243,120 @@ class TestProcessArchiveFile:
 
         assert exception_info.value is error
         assert destination_path.read_bytes() == existing_data
+        assert temporary_archive_paths(destination_path) == []
+
+    @pytest.mark.parametrize(
+        ("output_format", "extension"),
+        [("JPEG", ".jpg"), ("PNG", ".png"), ("WEBP", ".webp")],
+    )
+    def test_explicit_format_is_converted_verified_and_published(
+        self, output_format: str, extension: str, tmp_path: Path
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        create_archive_file(
+            source_path,
+            [
+                ("nested/page.PNG", create_encoded_image("PNG")),
+                ("ComicInfo.xml", b"metadata"),
+            ],
+        )
+        source_bytes = source_path.read_bytes()
+        process_archive_file(
+            source_path,
+            destination_path,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20), output_format=output_format
+                )
+            ),
+            verification_mode=OutputVerificationMode.CRC,
+        )
+        assert source_path.read_bytes() == source_bytes
+        assert temporary_archive_paths(destination_path) == []
+        output_name = f"nested/page{extension}"
+        with ZipFile(destination_path, mode="r") as destination:
+            assert destination.namelist() == [output_name, "ComicInfo.xml"]
+            with open_encoded_image(destination.read(output_name)) as image:
+                assert image.format == output_format
+            assert destination.read("ComicInfo.xml") == b"metadata"
+            assert destination.testzip() is None
+
+    def test_conversion_collision_preserves_source_and_existing_destination(
+        self, tmp_path: Path
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+        create_archive_file(
+            source_path,
+            [
+                ("page.jpeg", create_encoded_image("JPEG")),
+                ("page.png", create_encoded_image("PNG")),
+            ],
+        )
+        source_bytes = source_path.read_bytes()
+        destination_bytes = b"existing destination"
+        destination_path.write_bytes(destination_bytes)
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Output member path collision after image conversion: "
+                "'page.jpg' from 'page.jpeg' and 'page.png'."
+            ),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20), output_format="JPEG"
+                    )
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+        assert source_path.read_bytes() == source_bytes
+        assert destination_path.read_bytes() == destination_bytes
+        assert temporary_archive_paths(destination_path) == []
+
+    def test_portable_conversion_collision_preserves_source_and_existing_destination(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        source_path = tmp_path / "source.cbz"
+        destination_path = tmp_path / "destination.cbz"
+
+        create_archive_file(
+            source_path,
+            [
+                ("Page.png", create_encoded_image("PNG")),
+                ("page.jpeg", create_encoded_image("JPEG")),
+            ],
+        )
+
+        source_bytes = source_path.read_bytes()
+        destination_bytes = b"existing destination"
+        destination_path.write_bytes(destination_bytes)
+
+        with pytest.raises(
+            InvalidArchiveError,
+            match=exact_message(
+                "Output member paths collide across filesystems after image "
+                "conversion: 'Page.jpg' from 'Page.png' and "
+                "'page.jpg' from 'page.jpeg'."
+            ),
+        ):
+            process_archive_file(
+                source_path,
+                destination_path,
+                options=ArchiveTransformationOptions(
+                    image_options=ImageProcessingOptions(
+                        portrait_screen_size=(10, 20),
+                        output_format="JPEG",
+                    ),
+                ),
+                conflict_mode=DestinationConflictMode.REPLACE,
+            )
+
+        assert source_path.read_bytes() == source_bytes
+        assert destination_path.read_bytes() == destination_bytes
         assert temporary_archive_paths(destination_path) == []
