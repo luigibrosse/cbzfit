@@ -2,15 +2,21 @@
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from cbzfit import __version__
-from cbzfit.archive import (
-    InvalidArchiveError,
-)
+from cbzfit.archive import InvalidArchiveError
 from cbzfit.decode import (
     UnsupportedImageContentError,
     UnsupportedImageFormatError,
+)
+from cbzfit.encode import (
+    DEFAULT_JPEG_QUALITY,
+    DEFAULT_PNG_COMPRESSION_LEVEL,
+    DEFAULT_WEBP_METHOD,
+    DEFAULT_WEBP_QUALITY,
+    EncoderOptions,
 )
 from cbzfit.image import (
     InvalidScreenDimensionError,
@@ -30,6 +36,13 @@ from cbzfit.progress import TerminalProgressRenderer
 MEBIBYTE = 1024**2
 AUTOMATIC_DESTINATION_EXTENSIONS = frozenset({".cbz", ".zip"})
 AUTOMATIC_DESTINATION_MARKER = " [CBZFit]"
+OUTPUT_FORMATS = {
+    "original": "ORIGINAL",
+    "jpeg": "JPEG",
+    "jpg": "JPEG",
+    "png": "PNG",
+    "webp": "WEBP",
+}
 
 
 def positive_integer(value: str) -> int:
@@ -40,13 +53,35 @@ def positive_integer(value: str) -> int:
         raise argparse.ArgumentTypeError(
             f"expected a positive integer, got {value!r}"
         ) from error
-
     if parsed_value <= 0:
         raise argparse.ArgumentTypeError(
             f"expected a positive integer, got {value!r}"
         )
-
     return parsed_value
+
+
+def bounded_integer(
+    minimum: int,
+    maximum: int,
+) -> Callable[[str], int]:
+    """Return an argparse converter for an integer within inclusive bounds."""
+    if minimum > maximum:
+        raise ValueError("Minimum bound must not exceed maximum bound.")
+
+    def parse(value: str) -> int:
+        try:
+            parsed_value = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"expected an integer from {minimum} to {maximum}, got {value!r}"
+            ) from error
+        if not minimum <= parsed_value <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"expected an integer from {minimum} to {maximum}, got {value!r}"
+            )
+        return parsed_value
+
+    return parse
 
 
 def derive_destination_path(source: Path) -> Path:
@@ -114,6 +149,85 @@ def build_parser() -> argparse.ArgumentParser:
             "allow images smaller than the target display to be enlarged "
             "(default: disabled)"
         ),
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=tuple(OUTPUT_FORMATS),
+        default="original",
+        metavar="FORMAT",
+        help=(
+            "output image format: original, jpeg (or jpg), png, or webp "
+            "(default: original)"
+        ),
+    )
+    parser.add_argument(
+        "--reencode",
+        action="store_true",
+        help=(
+            "re-encode images even when no resize or format conversion is needed "
+            "(default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=bounded_integer(0, 95),
+        default=DEFAULT_JPEG_QUALITY,
+        metavar="0-95",
+        help=f"JPEG quality from 0 to 95 (default: {DEFAULT_JPEG_QUALITY})",
+    )
+    parser.add_argument(
+        "--jpeg-optimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable JPEG encoder optimization (default: enabled)",
+    )
+    parser.add_argument(
+        "--jpeg-progressive",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="encode progressive JPEG images (default: disabled)",
+    )
+    parser.add_argument(
+        "--png-compress-level",
+        type=bounded_integer(0, 9),
+        default=DEFAULT_PNG_COMPRESSION_LEVEL,
+        metavar="0-9",
+        help=(
+            "PNG compression level from 0 to 9; ignored when PNG optimization "
+            f"is enabled (default: {DEFAULT_PNG_COMPRESSION_LEVEL})"
+        ),
+    )
+    parser.add_argument(
+        "--png-optimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable PNG encoder optimization (default: enabled)",
+    )
+    parser.add_argument(
+        "--webp-quality",
+        type=bounded_integer(0, 100),
+        default=DEFAULT_WEBP_QUALITY,
+        metavar="0-100",
+        help=f"WebP quality from 0 to 100 (default: {DEFAULT_WEBP_QUALITY})",
+    )
+    parser.add_argument(
+        "--webp-method",
+        type=bounded_integer(0, 6),
+        default=DEFAULT_WEBP_METHOD,
+        metavar="0-6",
+        help=f"WebP encoding method from 0 to 6 (default: {DEFAULT_WEBP_METHOD})",
+    )
+    parser.add_argument(
+        "--webp-lossless",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use lossless WebP encoding (default: disabled)",
+    )
+    parser.add_argument(
+        "--preserve-icc-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="preserve compatible embedded ICC profiles (default: enabled)",
     )
     parser.add_argument(
         "--verify",
@@ -266,6 +380,17 @@ def main() -> int:
             progress_renderer.clear()
 
     try:
+        encoder_options = EncoderOptions(
+            jpeg_quality=arguments.jpeg_quality,
+            jpeg_optimize=arguments.jpeg_optimize,
+            jpeg_progressive=arguments.jpeg_progressive,
+            png_compress_level=arguments.png_compress_level,
+            png_optimize=arguments.png_optimize,
+            webp_quality=arguments.webp_quality,
+            webp_method=arguments.webp_method,
+            webp_lossless=arguments.webp_lossless,
+            preserve_icc_profile=arguments.preserve_icc_profile,
+        )
         image_options = ImageProcessingOptions(
             portrait_screen_size=(
                 arguments.screen_width,
@@ -273,6 +398,9 @@ def main() -> int:
             ),
             use_landscape_display=arguments.landscape_display,
             allow_upscale=arguments.upscale,
+            output_format=OUTPUT_FORMATS[arguments.output_format],
+            reencode=arguments.reencode,
+            encoder_options=encoder_options,
         )
         transformation_options = ArchiveTransformationOptions(
             image_options=image_options,
