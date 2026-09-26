@@ -18,6 +18,8 @@ from cbzfit.archive import (
 )
 from cbzfit.cli import (
     MEBIBYTE,
+    OUTPUT_FORMATS,
+    bounded_integer,
     build_parser,
     calculate_size_change_percentage,
     derive_destination_path,
@@ -32,6 +34,13 @@ from cbzfit.cli import (
 from cbzfit.decode import (
     UnsupportedImageContentError,
     UnsupportedImageFormatError,
+)
+from cbzfit.encode import (
+    DEFAULT_JPEG_QUALITY,
+    DEFAULT_PNG_COMPRESSION_LEVEL,
+    DEFAULT_WEBP_METHOD,
+    DEFAULT_WEBP_QUALITY,
+    EncoderOptions,
 )
 from cbzfit.image import (
     InvalidScreenDimensionError,
@@ -133,6 +142,41 @@ def prepare_cli_error_case(
     return arguments, expected_message
 
 
+def create_image_data(
+    image_format: str,
+    *,
+    size: tuple[int, int] = (10, 20),
+) -> bytes:
+    """Create deterministic encoded image data."""
+    output = BytesIO()
+    with Image.new("RGB", size, "white") as image:
+        image.save(output, format=image_format)
+    return output.getvalue()
+
+def create_archive(path: Path, members: list[tuple[str, bytes]]) -> None:
+    """Create a ZIP archive containing the supplied members."""
+    with ZipFile(path, mode="w") as archive:
+        for filename, data in members:
+            archive.writestr(filename, data)
+
+def successful_result() -> ArchiveProcessingResult:
+    """Return a minimal successful processing result for CLI wiring tests."""
+    return ArchiveProcessingResult(
+        transformation_result=ArchiveTransformationResult(
+            total_file_members=1,
+            image_members=1,
+            transformed_images=1,
+            unchanged_images=0,
+            copied_other_members=0,
+            input_uncompressed_size=100,
+            output_uncompressed_size=80,
+        ),
+        source_file_size=100,
+        destination_file_size=80,
+        elapsed_seconds=1.0,
+    )
+
+
 class TestPositiveInteger:
 
     @pytest.mark.parametrize(
@@ -174,6 +218,43 @@ class TestPositiveInteger:
             match=exact_message(expected_message),
         ):
             positive_integer(value)
+
+
+class TestBoundedInteger:
+    @pytest.mark.parametrize(
+        ("minimum", "maximum", "value", "expected"),
+        [
+            (0, 95, "0", 0),
+            (0, 95, "95", 95),
+            (0, 100, "+85", 85),
+        ],
+    )
+    def test_value_within_bounds_is_returned(
+        self,
+        minimum: int,
+        maximum: int,
+        value: str,
+        expected: int,
+    ) -> None:
+        assert bounded_integer(minimum, maximum)(value) == expected
+
+    @pytest.mark.parametrize("value", ["-1", "96", "3.5", "abc", ""])
+    def test_invalid_value_is_rejected(self, value: str) -> None:
+        with pytest.raises(
+            argparse.ArgumentTypeError,
+            match=exact_message(
+                f"expected an integer from 0 to 95, got {value!r}"
+            ),
+        ):
+            bounded_integer(0, 95)(value)
+
+    def test_reversed_bounds_are_rejected(self) -> None:
+        with pytest.raises(
+            ValueError,
+            match=exact_message("Minimum bound must not exceed maximum bound."),
+        ):
+            bounded_integer(10, 9)
+
 
 
 class TestDeriveDestinationPath:
@@ -543,6 +624,119 @@ class TestBuildParser:
 
         assert "unrecognized arguments" in error_output
         assert unknown_option in error_output
+
+    def test_defaults_preserve_existing_behavior(self) -> None:
+        arguments = build_parser().parse_args(required_arguments())
+
+        assert arguments.output_format == "original"
+        assert arguments.reencode is False
+        assert arguments.jpeg_quality == DEFAULT_JPEG_QUALITY
+        assert arguments.jpeg_optimize is True
+        assert arguments.jpeg_progressive is False
+        assert arguments.png_compress_level == DEFAULT_PNG_COMPRESSION_LEVEL
+        assert arguments.png_optimize is True
+        assert arguments.webp_quality == DEFAULT_WEBP_QUALITY
+        assert arguments.webp_method == DEFAULT_WEBP_METHOD
+        assert arguments.webp_lossless is False
+        assert arguments.preserve_icc_profile is True
+
+    @pytest.mark.parametrize("output_format", tuple(OUTPUT_FORMATS))
+    def test_output_formats_are_parsed(self, output_format: str) -> None:
+        arguments = build_parser().parse_args(
+            [*required_arguments(), "--output-format", output_format]
+        )
+        assert arguments.output_format == output_format
+
+    @pytest.mark.parametrize(
+        ("option", "minimum", "maximum"),
+        [
+            ("--jpeg-quality", 0, 95),
+            ("--png-compress-level", 0, 9),
+            ("--webp-quality", 0, 100),
+            ("--webp-method", 0, 6),
+        ],
+    )
+    @pytest.mark.parametrize("boundary", ["minimum", "maximum"])
+    def test_numeric_boundaries_are_parsed(
+        self,
+        option: str,
+        minimum: int,
+        maximum: int,
+        boundary: str,
+    ) -> None:
+        value = minimum if boundary == "minimum" else maximum
+        arguments = build_parser().parse_args(
+            [*required_arguments(), option, str(value)]
+        )
+        attribute = option.removeprefix("--").replace("-", "_")
+        assert getattr(arguments, attribute) == value
+
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("--jpeg-quality", "-1"),
+            ("--jpeg-quality", "96"),
+            ("--png-compress-level", "-1"),
+            ("--png-compress-level", "10"),
+            ("--webp-quality", "-1"),
+            ("--webp-quality", "101"),
+            ("--webp-method", "-1"),
+            ("--webp-method", "7"),
+            ("--jpeg-quality", "3.5"),
+            ("--webp-method", "abc"),
+        ],
+    )
+    def test_invalid_numeric_values_are_rejected(
+        self,
+        option: str,
+        value: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        with pytest.raises(SystemExit) as exception_info:
+            build_parser().parse_args([*required_arguments(), option, value])
+        assert exception_info.value.code == 2
+        assert option in capsys.readouterr().err
+
+    def test_all_boolean_controls_are_forward_and_reverse_configurable(self) -> None:
+        arguments = build_parser().parse_args(
+            [
+                *required_arguments(),
+                "--reencode",
+                "--no-jpeg-optimize",
+                "--jpeg-progressive",
+                "--no-png-optimize",
+                "--webp-lossless",
+                "--no-preserve-icc-profile",
+            ]
+        )
+        assert arguments.reencode is True
+        assert arguments.jpeg_optimize is False
+        assert arguments.jpeg_progressive is True
+        assert arguments.png_optimize is False
+        assert arguments.webp_lossless is True
+        assert arguments.preserve_icc_profile is False
+
+    def test_help_lists_image_options(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit) as exception_info:
+            build_parser().parse_args(["--help"])
+        assert exception_info.value.code == 0
+        output = capsys.readouterr().out
+        for option in (
+            "--output-format FORMAT",
+            "--reencode",
+            "--jpeg-quality 0-95",
+            "--jpeg-optimize",
+            "--no-jpeg-optimize",
+            "--jpeg-progressive",
+            "--png-compress-level 0-9",
+            "--png-optimize",
+            "--webp-quality 0-100",
+            "--webp-method 0-6",
+            "--webp-lossless",
+            "--preserve-icc-profile",
+            "--no-preserve-icc-profile",
+        ):
+            assert option in output
 
 
 class TestFormatCount:
@@ -1257,6 +1451,124 @@ class TestMain:
         process_archive.assert_called_once()
         print_summary.assert_not_called()
 
+    def test_defaults_are_forwarded_without_changing_existing_behavior(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        process = Mock(return_value=successful_result())
+        monkeypatch.setattr(cli_module, "process_archive_file", process)
+        monkeypatch.setattr(sys, "argv", ["cbzfit", *required_arguments()])
+
+        assert main() == 0
+
+        options = process.call_args.kwargs["options"]
+        assert options == ArchiveTransformationOptions(
+            image_options=ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                output_format="ORIGINAL",
+                reencode=False,
+                encoder_options=EncoderOptions(),
+            )
+        )
+
+    def test_custom_values_are_forwarded_exactly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        process = Mock(return_value=successful_result())
+        monkeypatch.setattr(cli_module, "process_archive_file", process)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                *required_arguments(),
+                "--no-landscape-display",
+                "--upscale",
+                "--output-format",
+                "webp",
+                "--reencode",
+                "--jpeg-quality",
+                "91",
+                "--no-jpeg-optimize",
+                "--jpeg-progressive",
+                "--png-compress-level",
+                "6",
+                "--no-png-optimize",
+                "--webp-quality",
+                "77",
+                "--webp-method",
+                "5",
+                "--webp-lossless",
+                "--no-preserve-icc-profile",
+            ],
+        )
+
+        assert main() == 0
+
+        options = process.call_args.kwargs["options"]
+        assert options == ArchiveTransformationOptions(
+            image_options=ImageProcessingOptions(
+                portrait_screen_size=(1404, 1872),
+                use_landscape_display=False,
+                allow_upscale=True,
+                output_format="WEBP",
+                reencode=True,
+                encoder_options=EncoderOptions(
+                    jpeg_quality=91,
+                    jpeg_optimize=False,
+                    jpeg_progressive=True,
+                    png_compress_level=6,
+                    png_optimize=False,
+                    webp_quality=77,
+                    webp_method=5,
+                    webp_lossless=True,
+                    preserve_icc_profile=False,
+                ),
+            )
+        )
+        assert process.call_args.kwargs["verification_mode"] is (
+            OutputVerificationMode.STRUCTURE
+        )
+        assert process.call_args.kwargs["conflict_mode"] is (
+            DestinationConflictMode.ERROR
+        )
+
+    @pytest.mark.parametrize(
+        ("cli_format", "expected_format"),
+        [
+            ("original", "ORIGINAL"),
+            ("jpeg", "JPEG"),
+            ("jpg", "JPEG"),
+            ("png", "PNG"),
+            ("webp", "WEBP"),
+        ],
+    )
+    def test_output_format_is_forwarded_canonically(
+        self,
+        cli_format: str,
+        expected_format: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        process = Mock(return_value=successful_result())
+        monkeypatch.setattr(cli_module, "process_archive_file", process)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                *required_arguments(),
+                "--output-format",
+                cli_format,
+            ],
+        )
+
+        assert main() == 0
+
+        options = process.call_args.kwargs["options"]
+        assert options.image_options.output_format == expected_format
+
+
 class TestCliErrorHandlingIntegration:
     @pytest.mark.parametrize(
         "case",
@@ -1416,6 +1728,201 @@ class TestCliProcessingIntegration:
                 output_image.load()
                 assert output_image.format == "PNG"
                 assert output_image.size == (10, 20)
+
+    def test_png_is_converted_to_jpeg(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = tmp_path / "source.cbz"
+        destination = tmp_path / "destination.cbz"
+        create_archive(source, [("001.png", create_image_data("PNG", size=(20, 40)))])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source),
+                str(destination),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--output-format",
+                "jpeg",
+                "--no-progress",
+            ],
+        )
+
+        assert main() == 0
+
+        with ZipFile(destination, mode="r") as archive:
+            assert archive.namelist() == ["001.jpg"]
+            with Image.open(BytesIO(archive.read("001.jpg"))) as image:
+                image.load()
+                assert image.format == "JPEG"
+                assert image.size == (10, 20)
+
+    def test_default_invocation_preserves_fitting_image_bytes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = tmp_path / "source.cbz"
+        destination = tmp_path / "destination.cbz"
+        source_image = create_image_data("PNG")
+        create_archive(source, [("001.png", source_image)])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source),
+                str(destination),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--no-progress",
+            ],
+        )
+
+        assert main() == 0
+
+        with ZipFile(destination, mode="r") as archive:
+            assert archive.namelist() == ["001.png"]
+            assert archive.read("001.png") == source_image
+
+    def test_reencode_transforms_fitting_same_format_image(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source = tmp_path / "source.cbz"
+        destination = tmp_path / "destination.cbz"
+        source_image = create_image_data("PNG")
+        create_archive(source, [("001.png", source_image)])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source),
+                str(destination),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--reencode",
+                "--no-png-optimize",
+                "--png-compress-level",
+                "0",
+                "--no-progress",
+            ],
+        )
+
+        assert main() == 0
+
+        with ZipFile(destination, mode="r") as archive:
+            assert archive.namelist() == ["001.png"]
+            assert archive.read("001.png") != source_image
+        assert "1 transformed, 0 unchanged" in capsys.readouterr().out
+
+    def test_conversion_collision_preserves_files_and_cleans_temporary_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source = tmp_path / "source.cbz"
+        destination = tmp_path / "destination.cbz"
+        create_archive(
+            source,
+            [
+                ("page.png", create_image_data("PNG")),
+                ("page.jpeg", create_image_data("JPEG")),
+            ],
+        )
+        source_bytes = source.read_bytes()
+        destination_bytes = b"existing destination"
+        destination.write_bytes(destination_bytes)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source),
+                str(destination),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--output-format",
+                "jpeg",
+                "--conflict",
+                "replace",
+                "--no-progress",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        assert exception_info.value.code == 1
+        assert "Output member path collision" in capsys.readouterr().err
+        assert source.read_bytes() == source_bytes
+        assert destination.read_bytes() == destination_bytes
+        assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+    def test_portable_conversion_collision_preserves_files_and_cleans_temporary_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        source = tmp_path / "source.cbz"
+        destination = tmp_path / "destination.cbz"
+        create_archive(
+            source,
+            [
+                ("Page.png", create_image_data("PNG")),
+                ("page.jpeg", create_image_data("JPEG")),
+            ],
+        )
+        source_bytes = source.read_bytes()
+        destination_bytes = b"existing destination"
+        destination.write_bytes(destination_bytes)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "cbzfit",
+                str(source),
+                str(destination),
+                "--screen-width",
+                "10",
+                "--screen-height",
+                "20",
+                "--output-format",
+                "jpeg",
+                "--conflict",
+                "replace",
+                "--no-progress",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exception_info:
+            main()
+
+        assert exception_info.value.code == 1
+        assert (
+            "Output member paths collide across filesystems"
+            in capsys.readouterr().err
+        )
+        assert source.read_bytes() == source_bytes
+        assert destination.read_bytes() == destination_bytes
+        assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
 
 
 class TestOptionalDestinationIntegration:
