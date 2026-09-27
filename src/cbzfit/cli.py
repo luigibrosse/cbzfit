@@ -332,6 +332,16 @@ def print_processing_summary(
     transformed_images = transformation.transformed_images
     unchanged_images = transformation.unchanged_images
     copied_other_members = transformation.copied_other_members
+    resized_images = transformation.resized_images
+    converted_images = transformation.converted_images
+    reencoded_images = transformation.reencoded_images
+    exif_reoriented_images = transformation.exif_reoriented_images
+    operation_count = (
+        resized_images
+        + converted_images
+        + reencoded_images
+        + exif_reoriented_images
+    )
 
     print(
         f"Output: {destination} completed in "
@@ -344,6 +354,13 @@ def print_processing_summary(
         f"{unchanged_images} unchanged. "
         f"{format_count('Other member', copied_other_members)} copied: "
         f"{copied_other_members}"
+    )
+    print(
+        f"└─{format_count('Operation', operation_count)}: "
+        f"{resized_images} resized, "
+        f"{converted_images} converted, "
+        f"{reencoded_images} re-encoded, "
+        f"{exif_reoriented_images} EXIF-reoriented"
     )
     print(
         f"└─Size: {format_file_size(result.source_file_size)} -> "

@@ -411,6 +411,10 @@ class TestProcessedImage:
             data=b"processed-image-data",
             format="PNG",
             transformed=True,
+            resized=False,
+            converted=False,
+            reencoded=False,
+            exif_reoriented=False,
         )
 
         assert result.data == b"processed-image-data"
@@ -422,6 +426,10 @@ class TestProcessedImage:
             data=b"processed-image-data",
             format="JPEG",
             transformed=False,
+            resized=False,
+            converted=False,
+            reencoded=False,
+            exif_reoriented=False,
         )
 
         assert result.size == len(b"processed-image-data")
@@ -1415,6 +1423,10 @@ class TestProcessImageData:
             data=b"resized-image-data",
             format="JPEG",
             transformed=True,
+            resized=True,
+            converted=False,
+            reencoded=False,
+            exif_reoriented=False,
         )
         resized_image.close.assert_called_once_with()
 
@@ -1580,6 +1592,109 @@ class TestProcessImageData:
         assert result.format == output_format
         assert result.transformed is True
 
+    def test_unchanged_copy_reports_no_operations(self) -> None:
+        source_data = create_encoded_image("PNG")
+
+        result = process_image_data(
+            source_data,
+            "001.png",
+            options=ImageProcessingOptions(portrait_screen_size=(10, 20)),
+        )
+
+        assert result == ProcessedImage(
+            data=source_data,
+            format="PNG",
+            transformed=False,
+            resized=False,
+            converted=False,
+            reencoded=False,
+            exif_reoriented=False,
+        )
+
+    def test_resize_and_conversion_are_reported_independently(self) -> None:
+        result = process_image_data(
+            create_encoded_image("PNG", size=(20, 40)),
+            "001.png",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                output_format="JPEG",
+            ),
+        )
+
+        assert result.transformed is True
+        assert result.resized is True
+        assert result.converted is True
+        assert result.reencoded is False
+        assert result.exif_reoriented is False
+
+    def test_forced_same_format_reencoding_is_reported_exclusively(self) -> None:
+        result = process_image_data(
+            create_encoded_image("PNG"),
+            "001.png",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(10, 20),
+                reencode=True,
+            ),
+        )
+
+        assert result.transformed is True
+        assert result.resized is False
+        assert result.converted is False
+        assert result.reencoded is True
+        assert result.exif_reoriented is False
+
+    @pytest.mark.parametrize("orientation", [None, 1])
+    def test_missing_or_normal_exif_orientation_is_not_reported(
+        self,
+        orientation: int | None,
+    ) -> None:
+        source_data = create_exif_oriented_jpeg(
+            orientation,
+            size=(10, 20),
+        )
+
+        result = process_image_data(
+            source_data,
+            "001.jpg",
+            options=ImageProcessingOptions(portrait_screen_size=(10, 20)),
+        )
+
+        assert result.data is source_data
+        assert result.transformed is False
+        assert result.resized is False
+        assert result.converted is False
+        assert result.reencoded is False
+        assert result.exif_reoriented is False
+
+    def test_exif_reorientation_and_resize_are_reported_independently(self) -> None:
+        result = process_image_data(
+            create_exif_oriented_jpeg(6, size=(40, 20)),
+            "001.jpg",
+            options=ImageProcessingOptions(portrait_screen_size=(10, 20)),
+        )
+
+        assert result.transformed is True
+        assert result.resized is True
+        assert result.converted is False
+        assert result.reencoded is False
+        assert result.exif_reoriented is True
+
+    def test_exif_reorientation_and_conversion_are_reported_independently(self) -> None:
+        result = process_image_data(
+            create_exif_oriented_jpeg(6, size=(10, 20)),
+            "001.jpg",
+            options=ImageProcessingOptions(
+                portrait_screen_size=(20, 40),
+                output_format="PNG",
+            ),
+        )
+
+        assert result.transformed is True
+        assert result.resized is False
+        assert result.converted is True
+        assert result.reencoded is False
+        assert result.exif_reoriented is True
+
 
 class TestArchiveTransformationOptions:
     def test_default_options_are_created(self) -> None:
@@ -1731,6 +1846,10 @@ class TestArchiveTransformationResult:
             transformed_images=2,
             unchanged_images=1,
             copied_other_members=1,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=1_000,
             output_uncompressed_size=600,
         )
@@ -1752,6 +1871,10 @@ class TestArchiveProcessingResult:
             transformed_images=1,
             unchanged_images=0,
             copied_other_members=0,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=200,
             output_uncompressed_size=100,
         )
@@ -1880,6 +2003,10 @@ class TestArchiveProgressReporting:
             transformed_images=0,
             unchanged_images=1,
             copied_other_members=0,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=100,
             output_uncompressed_size=100,
         )
@@ -2835,6 +2962,107 @@ class TestPrecomputeOutputMemberFilenames:
 
 
 class TestTransformArchiveContents:
+    def test_operation_counters_are_aggregated_independently(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source = Mock(spec=ZipFile)
+        destination = Mock(spec=ZipFile)
+        image_members = tuple(
+            ZipInfo(filename)
+            for filename in (
+                "001.png",
+                "002.png",
+                "003.png",
+                "004.png",
+            )
+        )
+        other_member = ZipInfo("ComicInfo.xml")
+        manifest = ArchiveManifest(
+            file_members=(*image_members, other_member),
+            image_members=image_members,
+            other_members=(other_member,),
+        )
+        processed_images = (
+            ProcessedImage(
+                data=b"resized and converted",
+                format="JPEG",
+                transformed=True,
+                resized=True,
+                converted=True,
+                reencoded=False,
+                exif_reoriented=False,
+            ),
+            ProcessedImage(
+                data=b"converted and reoriented",
+                format="JPEG",
+                transformed=True,
+                resized=False,
+                converted=True,
+                reencoded=False,
+                exif_reoriented=True,
+            ),
+            ProcessedImage(
+                data=b"reencoded",
+                format="PNG",
+                transformed=True,
+                resized=False,
+                converted=False,
+                reencoded=True,
+                exif_reoriented=False,
+            ),
+            ProcessedImage(
+                data=b"unchanged",
+                format="PNG",
+                transformed=False,
+                resized=False,
+                converted=False,
+                reencoded=False,
+                exif_reoriented=False,
+            ),
+        )
+
+        monkeypatch.setattr(
+            process_module,
+            "build_manifest",
+            Mock(return_value=manifest),
+        )
+        monkeypatch.setattr(
+            process_module,
+            "read_member_data",
+            Mock(return_value=b"source"),
+        )
+        monkeypatch.setattr(
+            process_module,
+            "process_image_data",
+            Mock(side_effect=processed_images),
+        )
+        monkeypatch.setattr(
+            process_module,
+            "write_member_data",
+            Mock(),
+        )
+
+        result = transform_archive_contents(
+            source,
+            destination,
+            options=ArchiveTransformationOptions(
+                image_options=ImageProcessingOptions(
+                    portrait_screen_size=(10, 20),
+                ),
+            ),
+        )
+
+        assert result.image_members == 4
+        assert result.transformed_images == 3
+        assert result.unchanged_images == 1
+        assert result.copied_other_members == 1
+        assert result.resized_images == 1
+        assert result.converted_images == 2
+        assert result.reencoded_images == 1
+        assert result.exif_reoriented_images == 1
+        assert result.transformed_images + result.unchanged_images == result.image_members
+
     def test_mixed_archive_is_transformed_in_original_order(self) -> None:
         large_image = create_encoded_image(
             "JPEG",
@@ -2902,6 +3130,10 @@ class TestTransformArchiveContents:
             transformed_images=1,
             unchanged_images=1,
             copied_other_members=1,
+            resized_images=1,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=(
                 len(large_image)
                 + len(metadata)
@@ -2951,6 +3183,10 @@ class TestTransformArchiveContents:
                     data=b"source image",
                     format="PNG",
                     transformed=False,
+                    resized=False,
+                    converted=False,
+                    reencoded=False,
+                    exif_reoriented=False,
                 )
             ),
         )
@@ -3041,6 +3277,10 @@ class TestTransformArchiveContents:
                 data=b"processed image",
                 format="JPEG",
                 transformed=True,
+                resized=False,
+                converted=False,
+                reencoded=False,
+                exif_reoriented=False,
             )
         )
         write = Mock()
@@ -3164,6 +3404,10 @@ class TestTransformArchiveContents:
             transformed_images=1,
             unchanged_images=0,
             copied_other_members=1,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=(
                 len(b"source image")
                 + len(b"metadata")
@@ -3407,6 +3651,10 @@ class TestTransformArchiveContents:
                 data=b"processed image",
                 format="JPEG",
                 transformed=True,
+                resized=False,
+                converted=False,
+                reencoded=False,
+                exif_reoriented=False,
             )
         )
         monkeypatch.setattr(
@@ -3497,7 +3745,15 @@ class TestTransformArchiveContents:
         monkeypatch.setattr(
             process_module,
             "process_image_data",
-            Mock(return_value=ProcessedImage(source_data, "PNG", False)),
+            Mock(return_value=ProcessedImage(
+                data=source_data,
+                format="PNG",
+                transformed=False,
+                resized=False,
+                converted=False,
+                reencoded=False,
+                exif_reoriented=False,
+            )),
         )
         write = Mock()
         monkeypatch.setattr(process_module, "write_member_data", write)
@@ -3672,6 +3928,10 @@ class TestProcessArchiveFile:
             transformed_images=1,
             unchanged_images=1,
             copied_other_members=1,
+            resized_images=1,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=(
                 len(large_image)
                 + len(metadata)
@@ -3774,6 +4034,10 @@ class TestProcessArchiveFile:
             transformed_images=0,
             unchanged_images=1,
             copied_other_members=0,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=100,
             output_uncompressed_size=100,
         )
@@ -4004,6 +4268,10 @@ class TestProcessArchiveFile:
             transformed_images=0,
             unchanged_images=1,
             copied_other_members=0,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=len(image_data),
             output_uncompressed_size=len(image_data),
         )
@@ -4043,6 +4311,10 @@ class TestProcessArchiveFile:
             transformed_images=0,
             unchanged_images=1,
             copied_other_members=0,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=100,
             output_uncompressed_size=100,
         )

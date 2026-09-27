@@ -113,6 +113,10 @@ class ProcessedImage:
     data: bytes
     format: str
     transformed: bool
+    resized: bool
+    converted: bool
+    reencoded: bool
+    exif_reoriented: bool
 
     @property
     def size(self) -> int:
@@ -171,6 +175,10 @@ class ArchiveTransformationResult:
     transformed_images: int
     unchanged_images: int
     copied_other_members: int
+    resized_images: int
+    converted_images: int
+    reencoded_images: int
+    exif_reoriented_images: int
     input_uncompressed_size: int
     output_uncompressed_size: int
 
@@ -259,6 +267,7 @@ def process_image_data(
                 image=image,
                 filename=filename,
             )
+            exif_reoriented = oriented_image is not image
             resized_image = oriented_image
 
             try:
@@ -273,11 +282,19 @@ def process_image_data(
                     if options.output_format == "ORIGINAL"
                     else options.output_format
                 )
+                resized = resized_image is not oriented_image
+                converted = output_format != source_format
+                reencoded = (
+                    options.reencode
+                    and not resized
+                    and not converted
+                    and not exif_reoriented
+                )
                 requires_encoding = (
-                    oriented_image is not image
-                    or resized_image is not oriented_image
-                    or output_format != source_format
-                    or options.reencode
+                    exif_reoriented
+                    or resized
+                    or converted
+                    or reencoded
                 )
 
                 if not requires_encoding:
@@ -285,6 +302,10 @@ def process_image_data(
                         data=data,
                         format=source_format,
                         transformed=False,
+                        resized=resized,
+                        converted=converted,
+                        reencoded=reencoded,
+                        exif_reoriented=exif_reoriented,
                     )
 
                 encoded_image = encode_image(
@@ -301,6 +322,10 @@ def process_image_data(
         data=encoded_image.data,
         format=encoded_image.format,
         transformed=True,
+        resized=resized,
+        converted=converted,
+        reencoded=reencoded,
+        exif_reoriented=exif_reoriented,
     )
 
 
@@ -413,6 +438,10 @@ def transform_archive_contents(
     transformed_images = 0
     unchanged_images = 0
     copied_other_members = 0
+    resized_images = 0
+    converted_images = 0
+    reencoded_images = 0
+    exif_reoriented_images = 0
     output_uncompressed_size = 0
 
     for completed_members, member in enumerate(
@@ -456,6 +485,14 @@ def transform_archive_contents(
                 transformed_images += 1
             else:
                 unchanged_images += 1
+            if processed_image.resized:
+                resized_images += 1
+            if processed_image.converted:
+                converted_images += 1
+            if processed_image.reencoded:
+                reencoded_images += 1
+            if processed_image.exif_reoriented:
+                exif_reoriented_images += 1
         else:
             output_data = member_data
 
@@ -488,6 +525,10 @@ def transform_archive_contents(
         transformed_images=transformed_images,
         unchanged_images=unchanged_images,
         copied_other_members=copied_other_members,
+        resized_images=resized_images,
+        converted_images=converted_images,
+        reencoded_images=reencoded_images,
+        exif_reoriented_images=exif_reoriented_images,
         input_uncompressed_size=read_state.total_size,
         output_uncompressed_size=output_uncompressed_size,
     )
