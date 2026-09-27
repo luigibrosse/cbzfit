@@ -168,6 +168,10 @@ def successful_result() -> ArchiveProcessingResult:
             transformed_images=1,
             unchanged_images=0,
             copied_other_members=0,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=100,
             output_uncompressed_size=80,
         ),
@@ -898,6 +902,10 @@ class TestPrintProcessingSummary:
                         transformed_images=100,
                         unchanged_images=100,
                         copied_other_members=100,
+                        resized_images=0,
+                        converted_images=0,
+                        reencoded_images=0,
+                        exif_reoriented_images=0,
                         input_uncompressed_size=1_000,
                         output_uncompressed_size=600,
                     ),
@@ -909,6 +917,8 @@ class TestPrintProcessingSummary:
                     "Output: optimized.cbz completed in 10.5 s\n"
                     "└─Images: 200 total, 100 transformed, "
                     "100 unchanged. Other members copied: 100\n"
+                    "└─Operations: 0 resized, 0 converted, 0 re-encoded, "
+                    "0 EXIF-reoriented\n"
                     "└─Size: 180.0 MiB -> 95.8 MiB, 46.8 % decrease\n"
                 ),
             ),
@@ -920,6 +930,10 @@ class TestPrintProcessingSummary:
                         transformed_images=1,
                         unchanged_images=0,
                         copied_other_members=1,
+                        resized_images=0,
+                        converted_images=0,
+                        reencoded_images=0,
+                        exif_reoriented_images=0,
                         input_uncompressed_size=100,
                         output_uncompressed_size=80,
                     ),
@@ -931,6 +945,8 @@ class TestPrintProcessingSummary:
                     "Output: optimized.cbz completed in 0.0 s\n"
                     "└─Image: 1 total, 1 transformed, "
                     "0 unchanged. Other member copied: 1\n"
+                    "└─Operations: 0 resized, 0 converted, 0 re-encoded, "
+                    "0 EXIF-reoriented\n"
                     "└─Size: 95.8 MiB -> 100.2 MiB, 4.6 % increase\n"
                 ),
             ),
@@ -942,6 +958,10 @@ class TestPrintProcessingSummary:
                         transformed_images=0,
                         unchanged_images=2,
                         copied_other_members=0,
+                        resized_images=0,
+                        converted_images=0,
+                        reencoded_images=0,
+                        exif_reoriented_images=0,
                         input_uncompressed_size=100,
                         output_uncompressed_size=100,
                     ),
@@ -953,6 +973,8 @@ class TestPrintProcessingSummary:
                     "Output: optimized.cbz completed in 1.0 s\n"
                     "└─Images: 2 total, 0 transformed, "
                     "2 unchanged. Other members copied: 0\n"
+                    "└─Operations: 0 resized, 0 converted, 0 re-encoded, "
+                    "0 EXIF-reoriented\n"
                     "└─Size: 95.8 MiB -> 95.8 MiB, no change\n"
                 ),
             ),
@@ -964,6 +986,10 @@ class TestPrintProcessingSummary:
                         transformed_images=0,
                         unchanged_images=1,
                         copied_other_members=0,
+                        resized_images=0,
+                        converted_images=0,
+                        reencoded_images=0,
+                        exif_reoriented_images=0,
                         input_uncompressed_size=0,
                         output_uncompressed_size=1,
                     ),
@@ -975,12 +1001,14 @@ class TestPrintProcessingSummary:
                     "Output: optimized.cbz completed in 0.0 s\n"
                     "└─Image: 1 total, 0 transformed, "
                     "1 unchanged. Other members copied: 0\n"
+                    "└─Operations: 0 resized, 0 converted, 0 re-encoded, "
+                    "0 EXIF-reoriented\n"
                     "└─Size: 0.0 MiB -> 1.0 MiB, percentage unavailable\n"
                 ),
             ),
         ],
     )
-    def test_exact_three_line_summary_is_printed(
+    def test_exact_four_line_summary_is_printed(
         self,
         result: ArchiveProcessingResult,
         expected_summary: str,
@@ -994,6 +1022,36 @@ class TestPrintProcessingSummary:
         assert captured.out == expected_summary
         assert captured.err == ""
 
+    def test_distinct_operation_counts_are_printed_in_the_expected_order(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        result = ArchiveProcessingResult(
+            transformation_result=ArchiveTransformationResult(
+                total_file_members=4,
+                image_members=4,
+                transformed_images=4,
+                unchanged_images=0,
+                copied_other_members=0,
+                resized_images=1,
+                converted_images=2,
+                reencoded_images=3,
+                exif_reoriented_images=4,
+                input_uncompressed_size=100,
+                output_uncompressed_size=80,
+            ),
+            source_file_size=100,
+            destination_file_size=80,
+            elapsed_seconds=1.0,
+        )
+
+        print_processing_summary(Path("optimized.cbz"), result)
+
+        assert capsys.readouterr().out.splitlines()[2] == (
+            "└─Operations: 1 resized, 2 converted, 3 re-encoded, "
+            "4 EXIF-reoriented"
+        )
+
     def test_destination_path_is_preserved_in_summary(
         self,
         capsys: pytest.CaptureFixture[str],
@@ -1006,6 +1064,10 @@ class TestPrintProcessingSummary:
                 transformed_images=0,
                 unchanged_images=1,
                 copied_other_members=0,
+                resized_images=0,
+                converted_images=0,
+                reencoded_images=0,
+                exif_reoriented_images=0,
                 input_uncompressed_size=100,
                 output_uncompressed_size=100,
             ),
@@ -1073,6 +1135,10 @@ class TestMain:
             transformed_images=1,
             unchanged_images=1,
             copied_other_members=1,
+            resized_images=0,
+            converted_images=0,
+            reencoded_images=0,
+            exif_reoriented_images=0,
             input_uncompressed_size=1_000,
             output_uncompressed_size=600,
         )
@@ -1136,6 +1202,10 @@ class TestMain:
                 transformed_images=0,
                 unchanged_images=1,
                 copied_other_members=0,
+                resized_images=0,
+                converted_images=0,
+                reencoded_images=0,
+                exif_reoriented_images=0,
                 input_uncompressed_size=100,
                 output_uncompressed_size=100,
             ),
@@ -1219,6 +1289,10 @@ class TestMain:
                 transformed_images=0,
                 unchanged_images=1,
                 copied_other_members=0,
+                resized_images=0,
+                converted_images=0,
+                reencoded_images=0,
+                exif_reoriented_images=0,
                 input_uncompressed_size=100,
                 output_uncompressed_size=100,
             ),
@@ -1695,7 +1769,7 @@ class TestCliProcessingIntegration:
         captured = capsys.readouterr()
         assert result == 0
         summary_lines = captured.out.splitlines()
-        assert len(summary_lines) == 3
+        assert len(summary_lines) == 4
         assert re.fullmatch(
             rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
             summary_lines[0],
@@ -1704,9 +1778,13 @@ class TestCliProcessingIntegration:
             "└─Image: 1 total, 1 transformed, 0 unchanged. "
             "Other member copied: 1"
         )
+        assert summary_lines[2] == (
+            "└─Operation: 1 resized, 0 converted, 0 re-encoded, "
+            "0 EXIF-reoriented"
+        )
         source_size = len(source_archive_data)
         destination_size = destination_path.stat().st_size
-        assert summary_lines[2] == (
+        assert summary_lines[3] == (
             f"└─Size: {format_file_size(source_size)} -> "
             f"{format_file_size(destination_size)}, "
             f"{format_size_change(source_size, destination_size)}"
@@ -2201,6 +2279,10 @@ class TestCliProgressIntegration:
                 transformed_images=0,
                 unchanged_images=1,
                 copied_other_members=0,
+                resized_images=0,
+                converted_images=0,
+                reencoded_images=0,
+                exif_reoriented_images=0,
                 input_uncompressed_size=100,
                 output_uncompressed_size=100,
             ),
@@ -2303,7 +2385,7 @@ class TestCliProgressIntegration:
         assert main() == 0
 
         summary_lines = capsys.readouterr().out.splitlines()
-        assert len(summary_lines) == 3
+        assert len(summary_lines) == 4
         assert re.fullmatch(
             rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
             summary_lines[0],
@@ -2312,7 +2394,7 @@ class TestCliProgressIntegration:
             "└─Image: 1 total, 0 transformed, 1 unchanged. "
             "Other member copied: 1"
         )
-        assert summary_lines[2].startswith("└─Size: ")
+        assert summary_lines[3].startswith("└─Size: ")
 
         progress_output = terminal.getvalue()
         assert "Verifying output archive..." in progress_output
@@ -2356,7 +2438,7 @@ class TestCliProgressIntegration:
         assert main() == 0
 
         summary_lines = capsys.readouterr().out.splitlines()
-        assert len(summary_lines) == 3
+        assert len(summary_lines) == 4
         assert re.fullmatch(
             rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
             summary_lines[0],
@@ -2365,7 +2447,7 @@ class TestCliProgressIntegration:
             "└─Image: 1 total, 0 transformed, 1 unchanged. "
             "Other members copied: 0"
         )
-        assert summary_lines[2].startswith("└─Size: ")
+        assert summary_lines[3].startswith("└─Size: ")
 
         progress_output = terminal.getvalue()
         assert "Processing [────────────────────] 0 % (0/1)" in progress_output
@@ -2408,7 +2490,7 @@ class TestCliProgressIntegration:
         assert main() == 0
 
         summary_lines = capsys.readouterr().out.splitlines()
-        assert len(summary_lines) == 3
+        assert len(summary_lines) == 4
         assert re.fullmatch(
             rf"Output: {re.escape(str(destination_path))} completed in \d+\.\d+ s",
             summary_lines[0],
@@ -2417,7 +2499,7 @@ class TestCliProgressIntegration:
             "└─Image: 1 total, 0 transformed, 1 unchanged. "
             "Other members copied: 0"
         )
-        assert summary_lines[2].startswith("└─Size: ")
+        assert summary_lines[3].startswith("└─Size: ")
 
         progress_output = terminal.getvalue()
         assert "Processing [████████████████████] 100 % (1/1)" in progress_output
@@ -2453,6 +2535,10 @@ class TestCliProgressIntegration:
                     transformed_images=0,
                     unchanged_images=1,
                     copied_other_members=0,
+                    resized_images=0,
+                    converted_images=0,
+                    reencoded_images=0,
+                    exif_reoriented_images=0,
                     input_uncompressed_size=100,
                     output_uncompressed_size=100,
                 ),
