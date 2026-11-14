@@ -37,7 +37,8 @@ class ArchiveProgress:
 
     def __post_init__(self) -> None:
         """Validate counts, member details, and phase-specific event shape."""
-        if not isinstance(self.phase, ArchiveProgressPhase):
+        # Runtime validation is intentional: annotations do not enforce caller inputs.
+        if not isinstance(self.phase, ArchiveProgressPhase): # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 "Archive progress phase must be an ArchiveProgressPhase, not "
                 f"{type(self.phase).__name__}."
@@ -56,7 +57,12 @@ class ArchiveProgress:
             raise ValueError("Publication progress must not contain member counts.")
 
         if is_determinate:
-            if not isinstance(self.completed, int) or not isinstance(self.total, int):
+            if (
+                not isinstance(self.completed, int)
+                or isinstance(self.completed, bool)
+                or not isinstance(self.total, int)
+                or isinstance(self.total, bool)
+            ):
                 raise TypeError("Progress counts must be integers.")
             if self.completed < 0:
                 raise ValueError("Completed progress must not be negative.")
@@ -68,7 +74,8 @@ class ArchiveProgress:
                 )
 
         if self.member_name is not None:
-            if not isinstance(self.member_name, str):
+            # Runtime validation is intentional: annotations do not enforce caller inputs.
+            if not isinstance(self.member_name, str): # pyright: ignore[reportUnnecessaryIsInstance]
                 raise TypeError("Progress member name must be a string.")
             if not self.member_name:
                 raise ValueError("Progress member name must not be empty.")
@@ -95,9 +102,7 @@ def _calculate_progress_geometry(
     total: int,
     bar_width: int,
 ) -> tuple[int, int]:
-    """Return floor-rounded percentage and completed bar cells."""
-    if bar_width <= 0:
-        raise ValueError("Progress bar width must be a positive integer.")
+    """Return floor-rounded geometry for validated counts and bar width."""
     return (
         completed * 100 // total,
         completed * bar_width // total,
@@ -109,7 +114,12 @@ def _format_progress(
     *,
     bar_width: int = PROGRESS_BAR_WIDTH,
 ) -> str | None:
-    """Format visible progress, or return None for silent publication."""
+    """Validate width, then format visible progress or silent publication."""
+    # Reject non-integers and booleans, including inputs from untyped callers.
+    if not isinstance(bar_width, int) or isinstance(bar_width, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise TypeError("Progress bar width must be an integer.")
+    if bar_width <= 0:
+        raise ValueError("Progress bar width must be a positive integer.")
     if progress.phase is ArchiveProgressPhase.PUBLISHING:
         return None
     if progress.phase is ArchiveProgressPhase.VERIFYING and progress.completed is None:
@@ -120,9 +130,14 @@ def _format_progress(
         if progress.phase is ArchiveProgressPhase.TRANSFORMING
         else "Verifying "
     )
+    completed = progress.completed
+    total = progress.total
+    if completed is None or total is None:
+        raise ValueError("Determinate progress requires completed and total counts.")
+
     percentage, completed_cells = _calculate_progress_geometry(
-        progress.completed,
-        progress.total,
+        completed,
+        total,
         bar_width,
     )
     bar = (
