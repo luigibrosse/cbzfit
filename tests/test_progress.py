@@ -51,102 +51,6 @@ class TestArchiveProgress:
         assert progress.total is None
         assert progress.member_name is None
 
-    def test_invalid_phase_type_is_rejected(self) -> None:
-        with pytest.raises(
-            TypeError,
-            match=exact_message(
-                "Archive progress phase must be an ArchiveProgressPhase, not str."
-            ),
-        ):
-            ArchiveProgress(phase="transforming")  # type: ignore[arg-type]
-
-    @pytest.mark.parametrize(
-        ("completed", "total"),
-        [(None, 1), (0, None)],
-    )
-    def test_partial_counts_are_rejected(
-        self,
-        completed: int | None,
-        total: int | None,
-    ) -> None:
-        with pytest.raises(
-            ValueError,
-            match=exact_message(
-                "Completed and total progress counts must be provided together."
-            ),
-        ):
-            ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=completed,
-                total=total,
-            )
-
-    @pytest.mark.parametrize(
-        ("completed", "total"),
-        [(0.0, 1), (0, 1.0)],
-    )
-    def test_non_integer_counts_are_rejected(
-        self,
-        completed: object,
-        total: object,
-    ) -> None:
-        with pytest.raises(
-            TypeError,
-            match=exact_message("Progress counts must be integers."),
-        ):
-            ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=completed,  # type: ignore[arg-type]
-                total=total,  # type: ignore[arg-type]
-            )
-
-    def test_boolean_counts_follow_normal_integer_behavior(self) -> None:
-        progress = ArchiveProgress(
-            phase=ArchiveProgressPhase.TRANSFORMING,
-            completed=False,
-            total=True,
-        )
-        assert progress.completed is False
-        assert progress.total is True
-
-    def test_negative_completed_count_is_rejected(self) -> None:
-        with pytest.raises(
-            ValueError,
-            match=exact_message("Completed progress must not be negative."),
-        ):
-            ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=-1,
-                total=1,
-            )
-
-    @pytest.mark.parametrize("total", [0, -1])
-    def test_non_positive_total_is_rejected(self, total: int) -> None:
-        with pytest.raises(
-            ValueError,
-            match=exact_message(
-                "Total progress must be a positive integer."
-            ),
-        ):
-            ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=0,
-                total=total,
-            )
-
-    def test_completed_count_above_total_is_rejected(self) -> None:
-        with pytest.raises(
-            ValueError,
-            match=exact_message(
-                "Completed progress must not exceed total progress."
-            ),
-        ):
-            ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=2,
-                total=1,
-            )
-
     def test_transformation_requires_determinate_counts(self) -> None:
         with pytest.raises(
             ValueError,
@@ -167,18 +71,6 @@ class TestArchiveProgress:
                 phase=ArchiveProgressPhase.PUBLISHING,
                 completed=0,
                 total=1,
-            )
-
-    def test_non_string_member_name_is_rejected(self) -> None:
-        with pytest.raises(
-            TypeError,
-            match=exact_message("Progress member name must be a string."),
-        ):
-            ArchiveProgress(
-                phase=ArchiveProgressPhase.TRANSFORMING,
-                completed=1,
-                total=1,
-                member_name=1,  # type: ignore[arg-type]
             )
 
     def test_empty_member_name_is_rejected(self) -> None:
@@ -220,6 +112,87 @@ class TestArchiveProgress:
                 total=progress.total,
                 member_name="001.png",
             )
+
+
+    @pytest.mark.parametrize("phase", [
+        ArchiveProgressPhase.TRANSFORMING, ArchiveProgressPhase.VERIFYING,
+    ])
+    @pytest.mark.parametrize(("completed", "total"), [
+        (False, 1), (True, 1), (0, False), (0, True),
+        (0.0, 1), (0, 1.0), ("0", 1), (0, "1"),
+        (object(), 1), (0, object()),
+    ])
+    def test_invalid_count_types_are_rejected_in_determinate_phases(
+        self, phase: ArchiveProgressPhase, completed: object, total: object,
+    ) -> None:
+        with pytest.raises(TypeError, match=exact_message("Progress counts must be integers.")):
+            ArchiveProgress(
+                phase, completed, total,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("phase", list(ArchiveProgressPhase))
+    @pytest.mark.parametrize(("completed", "total"), [(None, 1), (0, None)])
+    def test_partial_counts_are_rejected_in_every_phase(
+        self, phase: ArchiveProgressPhase, completed: int | None, total: int | None,
+    ) -> None:
+        with pytest.raises(ValueError, match=exact_message(
+            "Completed and total progress counts must be provided together."
+        )):
+            ArchiveProgress(phase, completed, total)
+
+    @pytest.mark.parametrize("phase", [
+        ArchiveProgressPhase.TRANSFORMING, ArchiveProgressPhase.VERIFYING,
+    ])
+    @pytest.mark.parametrize(("completed", "total", "message"), [
+        (-1, 1, "Completed progress must not be negative."),
+        (0, 0, "Total progress must be a positive integer."),
+        (0, -1, "Total progress must be a positive integer."),
+        (2, 1, "Completed progress must not exceed total progress."),
+    ])
+    def test_invalid_count_ranges_are_rejected_in_determinate_phases(
+        self, phase: ArchiveProgressPhase, completed: int, total: int, message: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=exact_message(message)):
+            ArchiveProgress(phase, completed, total)
+
+    @pytest.mark.parametrize("phase", [
+        ArchiveProgressPhase.TRANSFORMING, ArchiveProgressPhase.VERIFYING,
+    ])
+    @pytest.mark.parametrize(("completed", "total"), [
+        (0, 1), (1, 1), (1, 2), (2, 2), (10**100 - 1, 10**100),
+    ])
+    def test_valid_count_boundaries_are_retained(
+        self, phase: ArchiveProgressPhase, completed: int, total: int,
+    ) -> None:
+        progress = ArchiveProgress(phase, completed, total)
+        assert progress.completed == completed
+        assert progress.total == total
+
+    @pytest.mark.parametrize("phase", ["transforming", None, False, 1, object()])
+    def test_other_invalid_phase_types_are_rejected(self, phase: object) -> None:
+        with pytest.raises(TypeError, match=exact_message(
+            "Archive progress phase must be an ArchiveProgressPhase, not "
+            f"{type(phase).__name__}."
+        )):
+            ArchiveProgress(phase=phase)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("member_name", [1, False, 1.0, object()])
+    def test_other_invalid_member_name_types_are_rejected(
+        self, member_name: object,
+    ) -> None:
+        with pytest.raises(TypeError, match=exact_message(
+            "Progress member name must be a string."
+        )):
+            ArchiveProgress(
+                ArchiveProgressPhase.VERIFYING, 1, 1,
+                member_name=member_name,  # type: ignore[arg-type]
+            )
+
+    def test_publication_rejects_member_name_without_completed_work(self) -> None:
+        with pytest.raises(ValueError, match=exact_message(
+            "A progress member name requires completed work."
+        )):
+            ArchiveProgress(ArchiveProgressPhase.PUBLISHING, member_name="001.png")
 
 
 class TestReportProgress:
@@ -316,21 +289,120 @@ class TestProgressFormatting:
         progress: ArchiveProgress,
         expected: str | None,
     ) -> None:
-        assert progress_module._format_progress(progress) == expected
+        # Directly test private helpers to verify validation
+        # and arithmetic boundaries without expanding the public API.
+        assert progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
+            progress) == expected
 
-    def test_invalid_bar_width_is_rejected(self) -> None:
-        progress = ArchiveProgress(
-            phase=ArchiveProgressPhase.TRANSFORMING,
-            completed=0,
-            total=1,
-        )
+    @pytest.mark.parametrize("progress", [
+        ArchiveProgress(ArchiveProgressPhase.TRANSFORMING, 0, 1),
+        ArchiveProgress(ArchiveProgressPhase.VERIFYING, 0, 1),
+        ArchiveProgress(ArchiveProgressPhase.VERIFYING),
+        ArchiveProgress(ArchiveProgressPhase.PUBLISHING),
+    ])
+    @pytest.mark.parametrize("bar_width", [False, True, 1.0, "1", None, object()])
+    def test_non_integer_bar_width_is_rejected_in_every_event_shape(
+        self, progress: ArchiveProgress, bar_width: object,
+    ) -> None:
+        with pytest.raises(TypeError, match=exact_message(
+            "Progress bar width must be an integer."
+        )):
+            # Directly test private helpers to verify validation
+            # and arithmetic boundaries without expanding the public API
+            progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
+
+                progress, bar_width=bar_width,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("progress", [
+        ArchiveProgress(ArchiveProgressPhase.TRANSFORMING, 0, 1),
+        ArchiveProgress(ArchiveProgressPhase.VERIFYING, 0, 1),
+        ArchiveProgress(ArchiveProgressPhase.VERIFYING),
+        ArchiveProgress(ArchiveProgressPhase.PUBLISHING),
+    ])
+    @pytest.mark.parametrize("bar_width", [0, -1])
+    def test_non_positive_bar_width_is_rejected_in_every_event_shape(
+        self, progress: ArchiveProgress, bar_width: int,
+    ) -> None:
+        with pytest.raises(ValueError, match=exact_message(
+            "Progress bar width must be a positive integer."
+        )):
+            # Directly test private helpers to verify validation
+            # and arithmetic boundaries without expanding the public API
+            progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
+            progress, bar_width=bar_width)
+
+    @pytest.mark.parametrize(("phase", "expected"), [
+        (ArchiveProgressPhase.TRANSFORMING, "Processing [█──] 33 % (1/3)"),
+        (ArchiveProgressPhase.VERIFYING, "Verifying  [█──] 33 % (1/3)"),
+    ])
+    def test_custom_width_preserves_exact_rendering(
+        self, phase: ArchiveProgressPhase, expected: str,
+    ) -> None:
+        # Directly test private helpers to verify validation
+        # and arithmetic boundaries without expanding the public API
+        assert progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
+
+            ArchiveProgress(phase, 1, 3), bar_width=3,
+        ) == expected
+
+    @pytest.mark.parametrize(("progress", "expected"), [
+        (ArchiveProgress(ArchiveProgressPhase.VERIFYING), "Verifying output archive..."),
+        (ArchiveProgress(ArchiveProgressPhase.PUBLISHING), None),
+    ])
+    def test_minimum_valid_width_preserves_indeterminate_behavior(
+        self, progress: ArchiveProgress, expected: str | None,
+    ) -> None:
+        # Directly test private helpers to verify validation
+        # and arithmetic boundaries without expanding the public API
+        assert progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
+            progress, bar_width=1) == expected
+
+
+    @pytest.mark.parametrize(
+        ("completed", "total"),
+        [(None, None), (1, None), (None, 1)],
+    )
+    def test_determinate_rendering_rejects_corrupted_missing_counts(
+        self,
+        completed: int | None,
+        total: int | None,
+    ) -> None:
+        # Bypass constructor validation to exercise the defensive renderer guard.
+        progress = object.__new__(ArchiveProgress)
+        object.__setattr__(progress, "phase", ArchiveProgressPhase.TRANSFORMING)
+        object.__setattr__(progress, "completed", completed)
+        object.__setattr__(progress, "total", total)
+        object.__setattr__(progress, "member_name", None)
+
         with pytest.raises(
             ValueError,
             match=exact_message(
-                "Progress bar width must be a positive integer."
+                "Determinate progress requires completed and total counts."
             ),
         ):
-            progress_module._format_progress(progress, bar_width=0)
+            # Directly test private helpers to verify validation
+            # and arithmetic boundaries without expanding the public API
+            progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
+            progress)
+
+
+class TestCalculateProgressGeometry:
+    @pytest.mark.parametrize(("completed", "total", "bar_width", "expected"), [
+        (0, 1, 1, (0, 0)), (1, 1, 1, (100, 1)),
+        (1, 3, 20, (33, 6)), (2, 3, 20, (66, 13)),
+        (10**100 - 1, 10**100, 20, (99, 19)),
+        (10**100, 10**100, 20, (100, 20)),
+    ])
+    def test_validated_inputs_use_exact_integer_arithmetic(
+        self, completed: int, total: int, bar_width: int, expected: tuple[int, int],
+    ) -> None:
+        # Directly test private helpers to verify validation
+        # and arithmetic boundaries without expanding the public API
+        assert progress_module._calculate_progress_geometry(  # pyright: ignore[reportPrivateUsage]
+
+            completed, total, bar_width,
+        ) == expected
 
 
 class TestTerminalProgressRenderer:

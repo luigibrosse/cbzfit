@@ -32,6 +32,7 @@ Image processing and conversion release.
 - Resolve and validate converted member paths before image processing begins.
 - Reject exact and cross-platform portable output collisions introduced by conversion.
 - Preserve the source and existing destination and clean temporary output after conversion-collision failures.
+- Harden progress parameter validation, rejecting invalid counts, phases, member names, and rendering widths.
 
 ### Compatibility
 
