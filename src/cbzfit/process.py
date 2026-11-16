@@ -92,7 +92,8 @@ class ImageProcessingOptions:
             )
         if type(self.reencode) is not bool:
             raise TypeError("Re-encode must be a Boolean.")
-        if not isinstance(self.encoder_options, EncoderOptions):
+        # Runtime validation protects against incorrectly typed callers.
+        if not isinstance(self.encoder_options, EncoderOptions):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 "Encoder options must be an EncoderOptions instance."
             )
@@ -142,19 +143,20 @@ class ArchiveTransformationOptions:
 
     def __post_init__(self) -> None:
         """Validate archive-transformation settings."""
-        if not isinstance(self.image_options, ImageProcessingOptions):
+        # Runtime validation protects against incorrectly typed callers.
+        if not isinstance(self.image_options, ImageProcessingOptions):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 "Image options must be an ImageProcessingOptions instance."
             )
-        if not isinstance(self.read_limits, ArchiveReadLimits):
+        if not isinstance(self.read_limits, ArchiveReadLimits):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 "Archive read limits must be an ArchiveReadLimits instance."
             )
-        if not isinstance(self.path_limits, ArchivePathLimits):
+        if not isinstance(self.path_limits, ArchivePathLimits):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 "Archive path limits must be an ArchivePathLimits instance."
             )
-        if not isinstance(self.date_time_policy, MemberDateTimePolicy):
+        if not isinstance(self.date_time_policy, MemberDateTimePolicy):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 "Member date-time policy must be a "
                 "MemberDateTimePolicy instance."
@@ -538,7 +540,8 @@ def _validate_output_verification_mode(
     mode: OutputVerificationMode,
 ) -> None:
     """Validate an output verification mode."""
-    if not isinstance(mode, OutputVerificationMode):
+    # Runtime validation protects against incorrectly typed callers.
+    if not isinstance(mode, OutputVerificationMode):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise TypeError(
             "Output verification mode must be an "
             "OutputVerificationMode, not "
@@ -623,7 +626,8 @@ def _validate_destination_conflict_mode(
     mode: DestinationConflictMode,
 ) -> None:
     """Validate a destination conflict mode."""
-    if not isinstance(mode, DestinationConflictMode):
+    # Runtime validation protects against incorrectly typed callers.
+    if not isinstance(mode, DestinationConflictMode):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise TypeError(
             "Destination conflict mode must be a "
             "DestinationConflictMode, not "

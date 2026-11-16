@@ -233,6 +233,12 @@ class TestValidateZipDateTime:
             (2026, 1, 1, 0, 0, 0, 0),
             [2026, 1, 1, 0, 0, 0],
             (2026, 1, 1, 0, 0, "0"),
+            (True, 1, 1, 0, 0, 0),
+            (2026, True, 1, 0, 0, 0),
+            (2026, 1, True, 0, 0, 0),
+            (2026, 1, 1, True, 0, 0),
+            (2026, 1, 1, 0, True, 0),
+            (2026, 1, 1, 0, 0, False),
         ],
     )
     def test_timestamp_must_contain_exactly_six_integers(
@@ -247,11 +253,8 @@ class TestValidateZipDateTime:
             ValueError,
             match=exact_message(expected_message),
         ):
-            validate_zip_date_time(date_time)  # type: ignore[arg-type]
-
-    def test_boolean_timestamp_value_follows_normal_integer_behavior(self) -> None:
-        date_time = (2026, 1, 1, 0, 0, False)
-        assert validate_zip_date_time(date_time) is date_time
+            # Deliberately invalid argument to verify runtime validation.
+            validate_zip_date_time(date_time)  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
         "date_time",
@@ -351,7 +354,8 @@ class TestMemberDateTimePolicy:
             TypeError,
             match=exact_message(expected_message),
         ):
-            MemberDateTimePolicy(mode="modified")  # type: ignore[arg-type]
+            # Deliberately pass a string to verify strict enum validation.
+            MemberDateTimePolicy(mode="modified")  # pyright: ignore[reportArgumentType]
 
     def test_fixed_mode_requires_timestamp(self) -> None:
         expected_message = (
@@ -508,7 +512,8 @@ class TestArchivePathLimits:
             TypeError,
             match=exact_message(expected_message),
         ):
-            ArchivePathLimits(**arguments)  # type: ignore[arg-type]
+            # Deliberately pass invalid values to verify runtime type validation.
+            ArchivePathLimits(**arguments)  # pyright: ignore[reportArgumentType]
 
 
 class TestIsDirectoryMarker:
@@ -770,7 +775,8 @@ class TestValidateMemberPath:
         ):
             validate_member_path(
                 "001.jpg",
-                limits=limits,  # type: ignore[arg-type]
+                # Deliberately pass invalid values to verify runtime type validation.
+                limits=limits,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize(
@@ -879,7 +885,8 @@ class TestArchiveReadLimits:
             TypeError,
             match=exact_message(expected_message),
         ):
-            ArchiveReadLimits(**arguments)  # type: ignore[arg-type]
+            # Deliberately pass invalid values to verify runtime type validation.
+            ArchiveReadLimits(**arguments)  # pyright: ignore[reportArgumentType]
 
 
     @pytest.mark.parametrize(
@@ -920,7 +927,8 @@ class TestArchiveReadLimits:
             TypeError,
             match=exact_message(expected_message),
         ):
-            ArchiveReadLimits(**arguments)  # type: ignore[arg-type]
+            # Deliberately pass invalid types to verify runtime validation.
+            ArchiveReadLimits(**arguments)  # pyright: ignore[reportArgumentType]
 
 
 class TestArchiveReadState:
@@ -963,7 +971,8 @@ class TestPortableMemberPathKey:
         ):
             build_manifest(
                 archive,
-                max_files=max_files,  # type: ignore[arg-type]
+                # Deliberately invalid type to verify runtime validation.
+                max_files=max_files,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize(
@@ -1005,7 +1014,8 @@ class TestPortableMemberPathKey:
         ):
             build_manifest(
                 archive,
-                **{argument: value},  # type: ignore[arg-type]
+                # Deliberately invalid type to verify runtime validation.
+                **{argument: value},  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize(
@@ -2525,7 +2535,8 @@ class TestCloneMemberInfo:
         member.file_size = 789
         member.extra = b"stale-extra-record"
 
-        result = archive_module._clone_member_info(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        result = archive_module._clone_member_info(  # pyright: ignore[reportPrivateUsage]
             member,
             date_time=(2026, 8, 22, 16, 30, 58),
             compression=ZIP_STORED,
@@ -2565,7 +2576,8 @@ class TestCloneMemberInfo:
             ),
         )
 
-        result = archive_module._clone_member_info(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        result = archive_module._clone_member_info(  # pyright: ignore[reportPrivateUsage]
             member,
             date_time=(2026, 8, 22, 16, 30, 58),
             compression=ZIP_STORED,
@@ -2580,7 +2592,8 @@ class TestCloneMemberInfo:
     def test_replacement_filename_is_normalized(self) -> None:
         member = ZipInfo("001.jpg")
 
-        result = archive_module._clone_member_info(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        result = archive_module._clone_member_info(  # pyright: ignore[reportPrivateUsage]
             member,
             date_time=(2026, 8, 22, 16, 30, 58),
             compression=ZIP_STORED,
@@ -2601,7 +2614,8 @@ class TestCloneMemberInfo:
             InvalidArchiveError,
             match=exact_message(expected_message),
         ):
-            archive_module._clone_member_info(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            archive_module._clone_member_info(  # pyright: ignore[reportPrivateUsage]
                 member,
                 date_time=(2026, 8, 22, 16, 30, 58),
                 compression=ZIP_STORED,
@@ -2616,7 +2630,8 @@ class TestCloneMemberInfo:
             ValueError,
             match=exact_message(expected_message),
         ):
-            archive_module._clone_member_info(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            archive_module._clone_member_info(  # pyright: ignore[reportPrivateUsage]
                 ZipInfo("001.jpg"),
                 date_time=(2026, 8, 22, 16, 30, 58),
                 compression=ZIP_BZIP2,
@@ -2935,7 +2950,8 @@ class TestInspectCbz:
         ):
             inspect_cbz(
                 archive_path,
-                **{argument: value},  # type: ignore[arg-type]
+                # Deliberately pass invalid policy objects to verify runtime validation.
+                **{argument: value},  # pyright: ignore[reportArgumentType]
             )
 
     def test_inspect_cbz_rejects_missing_file(self, tmp_path: Path) -> None:

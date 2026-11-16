@@ -377,10 +377,11 @@ Install CBZFit with the development dependencies:
 python -m pip install -e ".[dev]"
 ```
 
-Run Ruff and the complete test suite with branch coverage:
+Run Ruff, strict Pyright, and the complete test suite with branch coverage:
 
 ```console
 python -m ruff check .
+python -m pyright
 python -m pytest --cov=cbzfit --cov-branch --cov-report=term-missing --cov-fail-under=100
 ```
 

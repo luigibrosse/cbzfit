@@ -25,7 +25,7 @@ from cbzfit.image import (
     resize_for_display,
     validate_portrait_screen_size,
 )
-from tests.helpers import exact_message
+from tests.helpers import create_srgb_profile_bytes, exact_message
 
 
 class TestInvalidScreenDimensionError:
@@ -60,7 +60,8 @@ class TestPreparedImage:
         ):
             PreparedImage(
                 image=image,
-                **{argument: value},  # type: ignore[arg-type]
+                # Deliberately pass invalid metadata to verify runtime validation.
+                **{argument: value},  # pyright: ignore[reportArgumentType]
             )
 
         image.close()
@@ -460,7 +461,8 @@ class TestApplyExifOrientation:
     @staticmethod
     def create_oriented_image(orientation: object) -> Image.Image:
         image = Image.new("RGB", (3, 2))
-        image.putdata(
+        # Pillow's optional NumPy typing is unresolved without NumPy.
+        image.putdata(  # pyright: ignore[reportUnknownMemberType]
             [
                 (255, 0, 0),
                 (0, 255, 0),
@@ -591,10 +593,7 @@ class TestGetEmbeddedIccProfile:
             size=(10, 20),
             color="white",
         )
-        profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        )
-        profile_data = profile.tobytes()
+        profile_data = create_srgb_profile_bytes()
         image.info["icc_profile"] = profile_data
 
         assert get_embedded_icc_profile(image) == profile_data
@@ -617,7 +616,8 @@ class TestFlattenTransparencyOnWhite:
             mode="RGBA",
             size=(3, 1),
         )
-        image.putdata(
+        # Pillow's optional NumPy typing is unresolved without NumPy.
+        image.putdata(  # pyright: ignore[reportUnknownMemberType]
             [
                 (255, 0, 0, 255),
                 (255, 0, 0, 128),
@@ -835,6 +835,54 @@ class TestConvertCmykToRgb:
         )
         target_profile.tobytes.assert_not_called()
 
+    @pytest.mark.parametrize("preserve_icc_profile", [False, True])
+    def test_cmyk_conversion_falls_back_when_profile_transform_returns_none(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        preserve_icc_profile: bool,
+    ) -> None:
+        image = Image.new("CMYK", (10, 20), (0, 0, 0, 255))
+        source_profile_data = b"valid-cmyk-profile"
+        image.info["icc_profile"] = source_profile_data
+        source_profile = Mock()
+        target_profile = Mock()
+        image_cms_profile = Mock(side_effect=[source_profile, target_profile])
+        created_srgb_profile = Mock()
+        create_profile = Mock(return_value=created_srgb_profile)
+        profile_to_profile = Mock(return_value=None)
+        monkeypatch.setattr(ImageCms, "ImageCmsProfile", image_cms_profile)
+        monkeypatch.setattr(ImageCms, "createProfile", create_profile)
+        monkeypatch.setattr(ImageCms, "profileToProfile", profile_to_profile)
+
+        result = convert_cmyk_to_rgb(
+            image,
+            preserve_icc_profile=preserve_icc_profile,
+        )
+
+        assert isinstance(result, PreparedImage)
+        assert result.image is not image
+        assert result.image.mode == "RGB"
+        assert result.image.size == image.size
+        assert result.image.getpixel((0, 0)) == (0, 0, 0)
+        assert result.icc_profile is None
+        assert image.mode == "CMYK"
+        assert image.info["icc_profile"] == source_profile_data
+        source_profile_stream = image_cms_profile.call_args_list[0].args[0]
+        assert source_profile_stream.getvalue() == source_profile_data
+        assert image_cms_profile.call_count == 2
+        image_cms_profile.assert_any_call(created_srgb_profile)
+        create_profile.assert_called_once_with("sRGB")
+        profile_to_profile.assert_called_once_with(
+            image,
+            source_profile,
+            target_profile,
+            outputMode="RGB",
+        )
+        target_profile.tobytes.assert_not_called()
+        result.image.close()
+        image.close()
+
+
 class TestPrepareImageForFormat:
     def test_compatible_image_preserves_embedded_exif(self) -> None:
         image = Image.new("RGB", (10, 20), "white")
@@ -897,7 +945,8 @@ class TestPrepareImageForFormat:
             mode="RGBA",
             size=(3, 1),
         )
-        image.putdata(
+        # Pillow's optional NumPy typing is unresolved without NumPy.
+        image.putdata(  # pyright: ignore[reportUnknownMemberType]
             [
                 (255, 0, 0, 255),
                 (255, 0, 0, 128),
@@ -1009,10 +1058,7 @@ class TestPrepareImageForFormat:
             size=(10, 20),
             color="white",
         )
-        profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        )
-        profile_data = profile.tobytes()
+        profile_data = create_srgb_profile_bytes()
         image.info["icc_profile"] = profile_data
 
         result = prepare_image_for_format(
@@ -1035,10 +1081,7 @@ class TestPrepareImageForFormat:
             size=(10, 20),
             color="white",
         )
-        profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        )
-        image.info["icc_profile"] = profile.tobytes()
+        image.info["icc_profile"] = create_srgb_profile_bytes()
 
         result = prepare_image_for_format(
             image,
@@ -1060,10 +1103,7 @@ class TestPrepareImageForFormat:
             size=(10, 20),
             color=(255, 0, 0, 128),
         )
-        profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        )
-        image.info["icc_profile"] = profile.tobytes()
+        image.info["icc_profile"] = create_srgb_profile_bytes()
 
         result = prepare_image_for_format(
             image,
@@ -1196,10 +1236,13 @@ class TestPrepareImageForFormat:
             f"Unsupported image format: {output_format!r}."
         )
 
+        def normalize_as_unimplemented(image_format: str) -> str:
+            return output_format
+
         monkeypatch.setattr(
             image_module,
             "normalize_image_format",
-            lambda image_format: output_format,
+            normalize_as_unimplemented,
         )
 
         with pytest.raises(

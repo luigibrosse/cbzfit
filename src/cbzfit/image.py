@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from io import BytesIO
+from typing import cast
 
 from PIL import ExifTags, Image, ImageCms, ImageOps
 
@@ -149,7 +150,8 @@ def resize_for_display(
     if target_size == image.size:
         return image
 
-    return image.resize(
+    # Pillow's optional NumPy typing is unresolved without NumPy.
+    return image.resize(  # pyright: ignore[reportUnknownMemberType]
         target_size,
         resample=resample,
     )
@@ -221,8 +223,12 @@ def convert_cmyk_to_rgb(
             BytesIO(source_icc_profile)
         )
 
+        # Pillow's conditional native-module import obscures the return type.
         target_profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
+            cast(
+                object,
+                ImageCms.createProfile("sRGB"),  # pyright: ignore[reportUnknownMemberType]
+            )
         )
 
         converted_image = ImageCms.profileToProfile(
@@ -235,6 +241,10 @@ def convert_cmyk_to_rgb(
         return PreparedImage(
             image=image.convert("RGB"),
         )
+
+    if converted_image is None:
+        # Pillow may return None; preserve the existing ordinary RGB fallback.
+        return PreparedImage(image=image.convert("RGB"))
 
     if preserve_icc_profile:
         return PreparedImage(

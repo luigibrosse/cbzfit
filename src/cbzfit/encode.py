@@ -185,7 +185,8 @@ def encode_image(
     )
     if options is None:
         encoder_options = EncoderOptions()
-    elif not isinstance(options, EncoderOptions):
+    # Runtime validation protects against untyped callers.
+    elif not isinstance(options, EncoderOptions):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise TypeError(
             "Encoder options must be an EncoderOptions instance."
         )

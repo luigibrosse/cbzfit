@@ -127,7 +127,8 @@ class TestArchiveProgress:
     ) -> None:
         with pytest.raises(TypeError, match=exact_message("Progress counts must be integers.")):
             ArchiveProgress(
-                phase, completed, total,  # type: ignore[arg-type]
+                # Deliberately pass invalid count types to verify runtime validation.
+                phase, completed, total,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize("phase", list(ArchiveProgressPhase))
@@ -174,7 +175,8 @@ class TestArchiveProgress:
             "Archive progress phase must be an ArchiveProgressPhase, not "
             f"{type(phase).__name__}."
         )):
-            ArchiveProgress(phase=phase)  # type: ignore[arg-type]
+            # Deliberately pass invalid phase types to verify runtime validation.
+            ArchiveProgress(phase=phase)  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize("member_name", [1, False, 1.0, object()])
     def test_other_invalid_member_name_types_are_rejected(
@@ -185,7 +187,8 @@ class TestArchiveProgress:
         )):
             ArchiveProgress(
                 ArchiveProgressPhase.VERIFYING, 1, 1,
-                member_name=member_name,  # type: ignore[arg-type]
+                # Deliberately pass invalid phase types to verify runtime validation.
+                member_name=member_name,  # pyright: ignore[reportArgumentType]
             )
 
     def test_publication_rejects_member_name_without_completed_work(self) -> None:
@@ -311,7 +314,8 @@ class TestProgressFormatting:
             # and arithmetic boundaries without expanding the public API
             progress_module._format_progress(  # pyright: ignore[reportPrivateUsage]
 
-                progress, bar_width=bar_width,  # type: ignore[arg-type]
+                # Deliberately pass invalid widths to verify runtime validation.
+                progress, bar_width=bar_width,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize("progress", [
