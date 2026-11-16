@@ -5,25 +5,39 @@ from io import BytesIO
 from unittest.mock import Mock
 
 import pytest
-from PIL import Image, ImageCms
+from PIL import Image
 
 import cbzfit.encode as encode_module
 from cbzfit.decode import UnsupportedImageFormatError
 from cbzfit.encode import (
-    DEFAULT_JPEG_QUALITY,
-    DEFAULT_PNG_COMPRESSION_LEVEL,
-    DEFAULT_WEBP_METHOD,
-    DEFAULT_WEBP_QUALITY,
-    EncodedImage,
-    EncoderOptions,
-    encode_image,
-    get_encoding_metadata,
-    save_jpeg,
-    save_png,
-    save_webp,
+            DEFAULT_JPEG_QUALITY,
+            DEFAULT_PNG_COMPRESSION_LEVEL,
+            DEFAULT_WEBP_METHOD,
+            DEFAULT_WEBP_QUALITY,
+            EncodedImage,
+            EncoderOptions,
+            encode_image,
+            get_encoding_metadata,
+            save_jpeg,
+            save_png,
+            save_webp,
 )
 from cbzfit.image import PreparedImage
-from tests.helpers import exact_message
+from tests.helpers import create_srgb_profile_bytes, exact_message
+
+integer_option_factories: dict[str, Callable[[int], EncoderOptions]] = {
+    "jpeg_quality": lambda value: EncoderOptions(jpeg_quality=value),
+    "png_compress_level": lambda value: EncoderOptions(png_compress_level=value),
+    "webp_quality": lambda value: EncoderOptions(webp_quality=value),
+    "webp_method": lambda value: EncoderOptions(webp_method=value),
+}
+
+def write_encoded_data(
+            source_image: Image.Image,
+            destination: BytesIO,
+            encoder_options: EncoderOptions,
+        ) -> None:
+            destination.write(b"encoded-data")
 
 
 class TestEncoderOptions:
@@ -63,7 +77,7 @@ class TestEncoderOptions:
         argument: str,
         value: int,
     ) -> None:
-        options = EncoderOptions(**{argument: value})
+        options = integer_option_factories[argument](value)
 
         assert getattr(options, argument) == value
         assert type(getattr(options, argument)) is int
@@ -123,7 +137,7 @@ class TestEncoderOptions:
             ValueError,
             match=exact_message(expected_message),
         ):
-            EncoderOptions(**{argument: value})
+            integer_option_factories[argument](value)
 
     @pytest.mark.parametrize(
         ("argument", "display_name"),
@@ -155,7 +169,8 @@ class TestEncoderOptions:
             TypeError,
             match=exact_message(f"{display_name} must be an integer."),
         ):
-            EncoderOptions(**{argument: value})  # type: ignore[arg-type]
+            # Deliberately pass invalid types to verify runtime validation.
+            EncoderOptions(**{argument: value})  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.parametrize(
         ("argument", "display_name"),
@@ -188,7 +203,8 @@ class TestEncoderOptions:
             TypeError,
             match=exact_message(f"{display_name} must be a Boolean."),
         ):
-            EncoderOptions(**{argument: value})  # type: ignore[arg-type]
+            # Deliberately pass non-Boolean values to verify strict runtime validation.
+            EncoderOptions(**{argument: value})  # pyright: ignore[reportArgumentType]
 
     def test_custom_boolean_options_are_retained(self) -> None:
         options = EncoderOptions(
@@ -621,7 +637,10 @@ class TestSaveWebp:
             assert encoded_image.format == "WEBP"
             assert encoded_image.mode == "RGBA"
             assert encoded_image.size == image.size
-            assert encoded_image.getpixel((0, 0))[3] == 128
+            pixel = encoded_image.getpixel((0, 0))
+
+            assert isinstance(pixel, tuple)
+            assert pixel[3] == 128
 
 
 class TestEncodeImage:
@@ -672,11 +691,7 @@ class TestEncodeImage:
         options = EncoderOptions(
             jpeg_quality=90,
         )
-        save = Mock(
-            side_effect=lambda source_image, destination, encoder_options: (
-                destination.write(b"encoded-data")
-            )
-        )
+        save = Mock(side_effect=write_encoded_data)
 
         monkeypatch.setattr(
             encode_module,
@@ -726,11 +741,7 @@ class TestEncodeImage:
         }
 
         for encoder_name, encoder in encoders.items():
-            encoder.side_effect = (
-                lambda source_image, destination, options: (
-                    destination.write(b"encoded-data")
-                )
-            )
+            encoder.side_effect = write_encoded_data
             monkeypatch.setattr(
                 encode_module,
                 encoder_name,
@@ -768,7 +779,8 @@ class TestEncodeImage:
             encode_image(
                 Mock(spec=Image.Image),
                 output_format="JPEG",
-                options=options,  # type: ignore[arg-type]
+                # Deliberately pass invalid options to verify runtime validation.
+                options=options,  # pyright: ignore[reportArgumentType]
             )
 
     def test_unsupported_output_format_is_rejected(self) -> None:
@@ -801,10 +813,13 @@ class TestEncodeImage:
             f"Unsupported image format: {output_format!r}."
         )
 
+        def normalize_as_avif(image_format: str) -> str:
+            return "AVIF"
+
         monkeypatch.setattr(
             encode_module,
             "normalize_image_format",
-            lambda image_format: "AVIF",
+            normalize_as_avif,
         )
 
         with pytest.raises(
@@ -834,10 +849,7 @@ class TestEncodeImage:
             size=(10, 20),
             color="white",
         )
-        profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        )
-        profile_data = profile.tobytes()
+        profile_data = create_srgb_profile_bytes()
         image.info["icc_profile"] = profile_data
 
         result = encode_image(
@@ -869,10 +881,7 @@ class TestEncodeImage:
             size=(10, 20),
             color="white",
         )
-        profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        )
-        image.info["icc_profile"] = profile.tobytes()
+        image.info["icc_profile"] = create_srgb_profile_bytes()
 
         result = encode_image(
             image,

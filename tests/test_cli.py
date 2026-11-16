@@ -58,6 +58,7 @@ from cbzfit.process import (
 from cbzfit.progress import (
     ArchiveProgress,
     ArchiveProgressPhase,
+    ProgressCallback,
 )
 from tests.helpers import exact_message
 
@@ -2295,18 +2296,21 @@ class TestCliProgressIntegration:
         def process_with_progress(
             source: Path,
             destination: Path,
-            **kwargs: object,
+            *,
+            options: ArchiveTransformationOptions,
+            verification_mode: OutputVerificationMode,
+            conflict_mode: DestinationConflictMode,
+            progress_callback: ProgressCallback | None,
         ) -> ArchiveProcessingResult:
-            callback = kwargs["progress_callback"]
-            assert callable(callback)
-            callback(
+            assert progress_callback is not None
+            progress_callback(
                 ArchiveProgress(
                     phase=ArchiveProgressPhase.TRANSFORMING,
                     completed=0,
                     total=1,
                 )
             )
-            callback(
+            progress_callback(
                 ArchiveProgress(
                     phase=ArchiveProgressPhase.TRANSFORMING,
                     completed=1,
@@ -2314,10 +2318,10 @@ class TestCliProgressIntegration:
                     member_name="001.png",
                 )
             )
-            callback(
+            progress_callback(
                 ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
             )
-            callback(
+            progress_callback(
                 ArchiveProgress(phase=ArchiveProgressPhase.PUBLISHING)
             )
             return processing_result
@@ -2578,11 +2582,14 @@ class TestCliProgressIntegration:
         def fail_with_progress(
             source: Path,
             destination: Path,
-            **kwargs: object,
+            *,
+            options: ArchiveTransformationOptions,
+            verification_mode: OutputVerificationMode,
+            conflict_mode: DestinationConflictMode,
+            progress_callback: ProgressCallback | None,
         ) -> ArchiveProcessingResult:
-            callback = kwargs["progress_callback"]
-            assert callable(callback)
-            callback(
+            assert progress_callback is not None
+            progress_callback(
                 ArchiveProgress(
                     phase=ArchiveProgressPhase.VERIFYING,
                     completed=1,
@@ -2621,11 +2628,14 @@ class TestCliProgressIntegration:
         def fail_with_progress(
             source: Path,
             destination: Path,
-            **kwargs: object,
+            *,
+            options: ArchiveTransformationOptions,
+            verification_mode: OutputVerificationMode,
+            conflict_mode: DestinationConflictMode,
+            progress_callback: ProgressCallback | None,
         ) -> ArchiveProcessingResult:
-            callback = kwargs["progress_callback"]
-            assert callable(callback)
-            callback(
+            assert progress_callback is not None
+            progress_callback(
                 ArchiveProgress(
                     phase=ArchiveProgressPhase.TRANSFORMING,
                     completed=0,

@@ -103,10 +103,12 @@ def validate_zip_date_time(
 ) -> ZipDateTime:
     """Validate and return a timestamp representable by the ZIP format."""
     if (
-        not isinstance(date_time, tuple)
+        # Runtime validation is intentional
+        not isinstance(date_time, tuple)  # pyright: ignore[reportUnnecessaryIsInstance]
         or len(date_time) != 6
         or any(
-            not isinstance(value, int)
+            # Runtime validation is intentional
+            isinstance(value, bool) or not isinstance(value, int)  # pyright: ignore[reportUnnecessaryIsInstance]
             for value in date_time
         )
     ):
@@ -146,7 +148,8 @@ class MemberDateTimePolicy:
 
     def __post_init__(self) -> None:
         """Validate the archive-member timestamp policy."""
-        if not isinstance(self.mode, MemberDateTimeMode):
+        # Runtime validation is intentional
+        if not isinstance(self.mode, MemberDateTimeMode):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise TypeError(
                 f"Archive-member timestamp mode must be a "
                 f"MemberDateTimeMode, not {type(self.mode).__name__}."
@@ -308,7 +311,8 @@ def validate_member_path(
     """
     if limits is None:
         path_limits = ArchivePathLimits()
-    elif not isinstance(limits, ArchivePathLimits):
+    # Runtime validation is intentional
+    elif not isinstance(limits, ArchivePathLimits):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise TypeError(
             "Archive path limits must be an ArchivePathLimits instance."
         )
@@ -752,7 +756,8 @@ def build_manifest(
 
     if read_limits is None:
         member_read_limits = ArchiveReadLimits()
-    elif not isinstance(read_limits, ArchiveReadLimits):
+    # Runtime validation is intentional
+    elif not isinstance(read_limits, ArchiveReadLimits):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise TypeError(
             "Archive read limits must be an ArchiveReadLimits instance."
         )
@@ -761,7 +766,8 @@ def build_manifest(
 
     if path_limits is None:
         member_path_limits = ArchivePathLimits()
-    elif not isinstance(path_limits, ArchivePathLimits):
+    # Runtime validation is intentional
+    elif not isinstance(path_limits, ArchivePathLimits):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise TypeError(
             "Archive path limits must be an ArchivePathLimits instance."
         )

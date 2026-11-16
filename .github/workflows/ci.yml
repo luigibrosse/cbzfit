@@ -42,6 +42,8 @@ jobs:
 
       - name: Run Ruff
         run: python -m ruff check .
+      - name: Run strict Pyright
+        run: python -m pyright
 
       - name: Run test suite with branch coverage
         run: >-

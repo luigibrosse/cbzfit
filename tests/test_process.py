@@ -14,7 +14,7 @@ from zipfile import (
 )
 
 import pytest
-from PIL import ExifTags, Image, ImageCms, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 
 import cbzfit.process as process_module
 from cbzfit.archive import (
@@ -62,8 +62,9 @@ from cbzfit.process import (
 from cbzfit.progress import (
     ArchiveProgress,
     ArchiveProgressPhase,
+    ProgressCallback,
 )
-from tests.helpers import exact_message
+from tests.helpers import create_srgb_profile_bytes, exact_message
 
 
 class TestSourceDestinationConflictError:
@@ -241,7 +242,8 @@ class TestImageProcessingOptions:
         ):
             ImageProcessingOptions(
                 portrait_screen_size=(1404, 1872),
-                output_format=output_format,  # type: ignore[arg-type]
+                # Deliberately pass invalid types to verify runtime validation.
+                output_format=output_format,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize(
@@ -277,7 +279,8 @@ class TestImageProcessingOptions:
         ):
             ImageProcessingOptions(
                 portrait_screen_size=(1404, 1872),
-                reencode=reencode,  # type: ignore[arg-type]
+                # Deliberately pass non-Boolean values to verify runtime validation.
+                reencode=reencode,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize(
@@ -296,7 +299,8 @@ class TestImageProcessingOptions:
         ):
             ImageProcessingOptions(
                 portrait_screen_size=(1404, 1872),
-                max_image_pixels=max_image_pixels,  # type: ignore[arg-type]
+                # Deliberately pass invalid types to verify runtime validation.
+                max_image_pixels=max_image_pixels,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize("max_image_pixels", [0, -1])
@@ -331,7 +335,8 @@ class TestImageProcessingOptions:
         ):
             ImageProcessingOptions(
                 portrait_screen_size=(1404, 1872),
-                encoder_options=encoder_options,  # type: ignore[arg-type]
+                # Deliberately pass invalid encoder options to verify runtime validation.
+                encoder_options=encoder_options,  # pyright: ignore[reportArgumentType]
             )
 
     def test_default_encoder_options_are_not_shared(self) -> None:
@@ -551,7 +556,9 @@ class TestProcessImageData:
             assert image.format == "WEBP"
             assert image.mode == "RGBA"
             assert image.size == (10, 20)
-            assert image.getpixel((0, 0))[3] == 128
+            pixel = image.getpixel((0, 0))
+            assert isinstance(pixel, tuple)
+            assert pixel[3] == 128
 
     @pytest.mark.parametrize(
         ("use_landscape_display", "expected_size"),
@@ -1286,7 +1293,7 @@ class TestProcessImageData:
     def test_decompression_bomb_warning_filter_is_local(
         self,
     ) -> None:
-        filters_before = warnings.filters.copy()
+        filters_before = list(warnings.filters)
         source_data = create_encoded_image("PNG", size=(10, 20))
 
         process_image_data(
@@ -1339,9 +1346,16 @@ class TestProcessImageData:
         source_data = create_encoded_image(
             "JPEG",
         )
-        resize_image = Mock(
-            side_effect=lambda **arguments: arguments["image"]
-        )
+        def return_original_image(
+            *,
+            image: Image.Image,
+            portrait_screen_size: tuple[int, int],
+            use_landscape_display: bool,
+            allow_upscale: bool,
+        ) -> Image.Image:
+            return image
+
+        resize_image = Mock(side_effect=return_original_image)
 
         monkeypatch.setattr(
             process_module,
@@ -1588,7 +1602,9 @@ class TestProcessImageData:
             ),
         )
         with open_encoded_image(result.data) as image:
-            assert image.convert("RGBA").getpixel((0, 0))[3] == 128
+            pixel = image.convert("RGBA").getpixel((0, 0))
+            assert isinstance(pixel, tuple)
+            assert pixel[3] == 128
         assert result.format == output_format
         assert result.transformed is True
 
@@ -1790,7 +1806,8 @@ class TestArchiveTransformationOptions:
                 image_options=ImageProcessingOptions(
                     portrait_screen_size=(1404, 1872),
                 ),
-                max_files=max_files,  # type: ignore[arg-type]
+                # Deliberately pass invalid types to verify runtime validation.
+                max_files=max_files,  # pyright: ignore[reportArgumentType]
             )
 
     @pytest.mark.parametrize(
@@ -1833,8 +1850,9 @@ class TestArchiveTransformationOptions:
             TypeError,
             match=exact_message(expected_message),
         ):
+            # Deliberately pass invalid nested configuration objects.
             ArchiveTransformationOptions(
-                **valid_arguments,  # type: ignore[arg-type]
+                **valid_arguments,  # pyright: ignore[reportArgumentType]
             )
 
 
@@ -2016,18 +2034,19 @@ class TestArchiveProgressReporting:
             destination_archive: ZipFile,
             *,
             options: ArchiveTransformationOptions,
-            progress_callback: object,
+            progress_callback: ProgressCallback | None = None,
         ) -> ArchiveTransformationResult:
             assert progress_callback is callback
+            assert progress_callback is not None
             destination_archive.writestr("001.png", b"output")
-            callback(
+            progress_callback(
                 ArchiveProgress(
                     phase=ArchiveProgressPhase.TRANSFORMING,
                     completed=0,
                     total=1,
                 )
             )
-            callback(
+            progress_callback(
                 ArchiveProgress(
                     phase=ArchiveProgressPhase.TRANSFORMING,
                     completed=1,
@@ -2088,8 +2107,9 @@ class TestArchiveProgressReporting:
             archive_path: Path,
             *,
             mode: OutputVerificationMode,
-            progress_callback: object,
+            progress_callback: ProgressCallback | None,
         ) -> None:
+            assert progress_callback is not None
             progress_callback(
                 ArchiveProgress(phase=ArchiveProgressPhase.VERIFYING)
             )
@@ -2270,7 +2290,8 @@ class TestValidateDestinationConflictMode:
         self,
         mode: DestinationConflictMode,
     ) -> None:
-        process_module._validate_destination_conflict_mode(mode)
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._validate_destination_conflict_mode(mode)  # pyright: ignore[reportPrivateUsage]
 
     @pytest.mark.parametrize(
         ("mode", "type_name"),
@@ -2294,7 +2315,9 @@ class TestValidateDestinationConflictMode:
             TypeError,
             match=exact_message(expected_message),
         ):
-            process_module._validate_destination_conflict_mode(mode)
+            # Direct testing of private function verifies behavior without exposing a public API.
+            # Deliberately invalid argument to verify runtime validation.
+            process_module._validate_destination_conflict_mode(mode)  # pyright: ignore[reportPrivateUsage, reportArgumentType]
 
 
 class TestPublishArchive:
@@ -2307,7 +2330,8 @@ class TestPublishArchive:
         archive_data = b"completed archive"
         temporary_path.write_bytes(archive_data)
 
-        process_module._publish_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._publish_archive(  # pyright: ignore[reportPrivateUsage]
             temporary_path,
             destination_path,
             conflict_mode=DestinationConflictMode.ERROR,
@@ -2334,7 +2358,8 @@ class TestPublishArchive:
             FileExistsError,
             match=exact_message(expected_message),
         ) as exception_info:
-            process_module._publish_archive(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            process_module._publish_archive(  # pyright: ignore[reportPrivateUsage]
                 temporary_path,
                 destination_path,
                 conflict_mode=DestinationConflictMode.ERROR,
@@ -2358,7 +2383,8 @@ class TestPublishArchive:
 
         with monkeypatch.context() as unlink_patch:
             unlink_patch.setattr(process_module.Path, "unlink", unlink)
-            process_module._publish_archive(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            process_module._publish_archive(  # pyright: ignore[reportPrivateUsage]
                 temporary_path,
                 destination_path,
                 conflict_mode=DestinationConflictMode.ERROR,
@@ -2377,7 +2403,8 @@ class TestPublishArchive:
         temporary_path.write_bytes(b"replacement archive")
         destination_path.write_bytes(b"existing archive")
 
-        process_module._publish_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._publish_archive(  # pyright: ignore[reportPrivateUsage]
             temporary_path,
             destination_path,
             conflict_mode=DestinationConflictMode.REPLACE,
@@ -2407,10 +2434,12 @@ class TestPublishArchive:
             TypeError,
             match=exact_message(expected_message),
         ):
-            process_module._publish_archive(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            process_module._publish_archive(  # pyright: ignore[reportPrivateUsage]
                 temporary_path,
                 destination_path,
-                conflict_mode="error",
+                # Deliberately invalid argument to verify runtime validation.
+                conflict_mode="error",  # pyright: ignore[reportArgumentType]
             )
 
         link.assert_not_called()
@@ -2425,7 +2454,8 @@ class TestValidateOutputVerificationMode:
         self,
         mode: OutputVerificationMode,
     ) -> None:
-        process_module._validate_output_verification_mode(mode)
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._validate_output_verification_mode(mode)  # pyright: ignore[reportPrivateUsage]
 
     @pytest.mark.parametrize(
         ("mode", "type_name"),
@@ -2449,7 +2479,9 @@ class TestValidateOutputVerificationMode:
             TypeError,
             match=exact_message(expected_message),
         ):
-            process_module._validate_output_verification_mode(mode)
+            # Direct testing of private function verifies behavior without exposing a public API.
+            # Deliberately invalid argument to verify runtime validation.
+            process_module._validate_output_verification_mode(mode)  # pyright: ignore[reportPrivateUsage, reportArgumentType]
 
 
 class TestVerifyOutputArchive:
@@ -2468,7 +2500,8 @@ class TestVerifyOutputArchive:
 
         progress_callback = Mock()
 
-        process_module._verify_output_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
             archive_path,
             mode=OutputVerificationMode.NONE,
             progress_callback=progress_callback,
@@ -2503,7 +2536,8 @@ class TestVerifyOutputArchive:
             open_archive_mock,
         )
 
-        process_module._verify_output_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
             archive_path,
             mode=OutputVerificationMode.STRUCTURE,
             progress_callback=events.append,
@@ -2555,7 +2589,8 @@ class TestVerifyOutputArchive:
             Mock(side_effect=open_archive),
         )
 
-        process_module._verify_output_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
             archive_path,
             mode=OutputVerificationMode.CRC,
             progress_callback=report,
@@ -2590,7 +2625,8 @@ class TestVerifyOutputArchive:
             archive.writestr("Chapter 01/001.png", b"image data")
         events: list[ArchiveProgress] = []
 
-        process_module._verify_output_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
             archive_path,
             mode=OutputVerificationMode.CRC,
             progress_callback=events.append,
@@ -2641,7 +2677,8 @@ class TestVerifyOutputArchive:
             Mock(return_value=archive_context),
         )
 
-        process_module._verify_output_archive(
+        # Direct testing of private function verifies behavior without exposing a public API.
+        process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
             archive_path,
             mode=OutputVerificationMode.CRC,
             progress_callback=callback,
@@ -2700,9 +2737,11 @@ class TestVerifyOutputArchive:
             TypeError,
             match=exact_message(expected_message),
         ):
-            process_module._verify_output_archive(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
                 archive_path,
-                mode="structure",
+                # Deliberately invalid argument to verify runtime validation.
+                mode="structure",  # pyright: ignore[reportArgumentType]
             )
 
         open_archive.assert_not_called()
@@ -2736,7 +2775,8 @@ class TestVerifyOutputArchive:
             InvalidArchiveError,
             match=exact_message(expected_message),
         ) as exception_info:
-            process_module._verify_output_archive(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
                 archive_path,
                 mode=verification_mode,
                 progress_callback=events.append,
@@ -2788,7 +2828,8 @@ class TestVerifyOutputArchive:
             InvalidArchiveError,
             match=exact_message(expected_message),
         ) as exception_info:
-            process_module._verify_output_archive(
+            # Direct testing of private function verifies behavior without exposing a public API.
+            process_module._verify_output_archive(  # pyright: ignore[reportPrivateUsage]
                 archive_path,
                 mode=OutputVerificationMode.CRC,
                 progress_callback=events.append,
@@ -3261,7 +3302,7 @@ class TestTransformArchiveContents:
 
         def read_member(
             archive: ZipFile,
-            member: object,
+            member: ZipInfo,
             *,
             limits: ArchiveReadLimits,
             state: ArchiveReadState,
@@ -3774,9 +3815,7 @@ class TestTransformArchiveContents:
     def test_conversion_preserves_icc_and_safe_exif_without_orientation(
         self,
     ) -> None:
-        icc_profile = ImageCms.ImageCmsProfile(
-            ImageCms.createProfile("sRGB")
-        ).tobytes()
+        icc_profile = create_srgb_profile_bytes()
         image = Image.new("RGB", (20, 10), "white")
         exif = image.getexif()
         exif[ExifTags.Base.ImageDescription] = "unrelated metadata"
@@ -4042,7 +4081,8 @@ class TestProcessArchiveFile:
             output_uncompressed_size=100,
         )
         transform = Mock(return_value=transformation_result)
-        real_publish = process_module._publish_archive
+        # Direct testing of private function verifies behavior without exposing a public API.
+        real_publish = process_module._publish_archive  # pyright: ignore[reportPrivateUsage]
 
         def publish_after_archives_are_closed(
             temporary_path: Path,
@@ -4129,7 +4169,8 @@ class TestProcessArchiveFile:
             [("001.png", create_encoded_image("PNG"))],
         )
         published_suffix = b"published-size-marker"
-        real_publish = process_module._publish_archive
+        # Direct testing of private function verifies behavior without exposing a public API.
+        real_publish = process_module._publish_archive  # pyright: ignore[reportPrivateUsage]
 
         def publish_and_extend_destination(
             temporary_path: Path,
@@ -4174,7 +4215,8 @@ class TestProcessArchiveFile:
         )
         events: list[str] = []
         real_transform = process_module.transform_archive_contents
-        real_publish = process_module._publish_archive
+        # Direct testing of private function verifies behavior without exposing a public API.
+        real_publish = process_module._publish_archive  # pyright: ignore[reportPrivateUsage]
 
         def timer() -> float:
             if not events:
@@ -4185,11 +4227,19 @@ class TestProcessArchiveFile:
             return 21.5
 
         def track_transform(
-            *args: object,
-            **kwargs: object
+            source_archive: ZipFile,
+            destination_archive: ZipFile,
+            *,
+            options: ArchiveTransformationOptions,
+            progress_callback: ProgressCallback | None = None,
         ) -> ArchiveTransformationResult:
             events.append("transform")
-            return real_transform(*args, **kwargs)  # type: ignore[arg-type]
+            return real_transform(
+                source_archive,
+                destination_archive,
+                options=options,
+                progress_callback=progress_callback,
+            )
 
         def track_publish(
             temporary_path: Path,
@@ -4319,14 +4369,15 @@ class TestProcessArchiveFile:
             output_uncompressed_size=100,
         )
         transform = Mock(return_value=expected_result)
-        real_publish = process_module._publish_archive
+        # Direct testing of private function verifies behavior without exposing a public API.
+        real_publish = process_module._publish_archive  # pyright: ignore[reportPrivateUsage]
         events: list[str] = []
 
         def verify_after_archives_are_closed(
             archive_path: Path,
             *,
             mode: OutputVerificationMode,
-            progress_callback: object,
+            progress_callback: ProgressCallback | None,
         ) -> None:
             assert progress_callback is None
             source_archive, destination_archive = transform.call_args.args
@@ -4449,7 +4500,8 @@ class TestProcessArchiveFile:
                         portrait_screen_size=(10, 20),
                     ),
                 ),
-                verification_mode="crc",
+                # Deliberately invalid argument to verify runtime validation.
+                verification_mode="crc",  # pyright: ignore[reportArgumentType]
             )
 
         create_temporary.assert_not_called()
@@ -5130,7 +5182,8 @@ class TestProcessArchiveFile:
                         portrait_screen_size=(10, 20),
                     ),
                 ),
-                conflict_mode="replace",
+                # Deliberately invalid argument to verify runtime validation.
+                conflict_mode="replace",  # pyright: ignore[reportArgumentType]
             )
 
         create_temporary.assert_not_called()
@@ -5245,7 +5298,7 @@ class TestProcessArchiveFile:
         ) -> ZipFile | FailingDestinationArchive:
             if mode == "w":
                 return FailingDestinationArchive(archive_path)
-            return real_zip_file(archive_path, mode=mode)
+            return real_zip_file(archive_path, mode="r")
 
         verify = Mock()
         publish = Mock()
@@ -5399,7 +5452,8 @@ class TestProcessArchiveFile:
             [("001.png", create_encoded_image("PNG"))],
         )
 
-        real_publish = process_module._publish_archive
+        # Direct testing of private function verifies behavior without exposing a public API.
+        real_publish = process_module._publish_archive  # pyright: ignore[reportPrivateUsage]
 
         def create_destination_before_publication(
             temporary_path: Path,
